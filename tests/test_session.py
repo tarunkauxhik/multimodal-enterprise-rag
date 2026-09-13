@@ -161,5 +161,16 @@ def test_upload_size_error():
     assert "above the 200 MB upload limit" in message and "STREAMLIT_SERVER_MAX_UPLOAD_SIZE" in message
 
 
+def test_answer_model_runs_with_thinking_disabled_understanding_keeps_default(monkeypatch):
+    for name in ("MINIMAX_API_KEY", "GEMINI_API_KEY", "JINA_API_KEY"):
+        monkeypatch.setenv(name, "test-key")
+    calls = []
+    monkeypatch.setattr(session, "minimax_client", lambda *args, **kwargs: calls.append(kwargs) or (lambda m: ""))
+    session.build_services()
+    answer_kwargs, understand_kwargs = calls
+    assert answer_kwargs["thinking"] is False
+    assert "thinking" not in understand_kwargs
+
+
 def test_redact_removes_every_secret():
     assert session.redact("key sk-a failed, retry sk-b", ["sk-a", "sk-b"]) == "key *** failed, retry ***"

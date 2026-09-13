@@ -50,6 +50,7 @@ class Answer:
     citations: list[tuple[str, int]] = field(default_factory=list)  # valid (document, page), first-use order
     sources: list[dict] = field(default_factory=list)  # supplied chunks behind the citations, for display
     removed_citations: list[str] = field(default_factory=list)  # citations not matching the context
+    raw_output: str = ""  # model reply before any processing (<think> stripping, citation checks), for evaluation
 
 
 _SOURCE_TAG = re.compile(r"<\s*(/?)\s*source", re.I)
@@ -145,16 +146,17 @@ def generate_answer(query: str, chunks: Sequence[dict], complete: Complete) -> A
     if not chunks:
         return Answer(ABSTAIN_MESSAGE, abstained=True)
 
-    text = strip_think(complete(build_messages(query, chunks)))
+    raw = complete(build_messages(query, chunks))
+    text = strip_think(raw)
     if not text or ABSTAIN_TOKEN in text:
-        return Answer(ABSTAIN_MESSAGE, abstained=True)
+        return Answer(ABSTAIN_MESSAGE, abstained=True, raw_output=raw)
 
     text, citations, removed = validate_citations(text, [(c["source_name"], int(c["page_number"])) for c in chunks])
     if not citations:
         # ponytail: uncited answers are treated as ungrounded; relax only if evals show good answers being lost
-        return Answer(ABSTAIN_MESSAGE, abstained=True, removed_citations=removed)
+        return Answer(ABSTAIN_MESSAGE, abstained=True, removed_citations=removed, raw_output=raw)
     sources = [c for c in chunks if (c["source_name"], int(c["page_number"])) in citations]
-    return Answer(text, abstained=False, citations=citations, sources=sources, removed_citations=removed)
+    return Answer(text, abstained=False, citations=citations, sources=sources, removed_citations=removed, raw_output=raw)
 
 
 def minimax_client(
@@ -162,6 +164,7 @@ def minimax_client(
     base_url: str,
     *,
     max_tokens: int = GENERATION_MAX_TOKENS,
+    thinking: bool = True,  # False sends thinking={"type": "disabled"} (supported by MiniMax-M3)
     attempts: int = 5,
     timeout: float = 120.0,
     transport: httpx.BaseTransport | None = None,
@@ -173,6 +176,8 @@ def minimax_client(
 
     def complete(messages: list[dict]) -> str:
         body = {"model": MINIMAX_MODEL, "messages": messages, "max_tokens": max_tokens}
+        if not thinking:
+            body["thinking"] = {"type": "disabled"}
         error = ""
         for attempt in range(attempts):
             retryable = True

@@ -18,6 +18,10 @@ UNDERSTAND_CACHE_PATH = DATA_DIR / "cache" / "understanding.sqlite"
 # --- Benchmarked decisions (see CLAUDE.md before changing) ---
 MINIMAX_MODEL = "MiniMax-M3"
 GENERATION_MAX_TOKENS = 4096  # includes M3 <think> reasoning tokens; not benchmarked
+# Answers run with M3 thinking disabled: with thinking on, M3 intermittently starts the answer before
+# closing </think> (github.com/MiniMax-AI/MiniMax-M3/issues/28), so stripping the reasoning drops the
+# answer's opening words. Verified via our gateway: no <think> output, citations and abstention intact.
+GENERATION_THINKING = False
 UNDERSTAND_MAX_TOKENS = 8192  # page transcription can be long; not benchmarked
 UNDERSTAND_DPI = 150  # page render resolution sent to M3 (~3.2k prompt tokens per page)
 

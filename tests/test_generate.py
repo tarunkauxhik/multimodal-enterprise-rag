@@ -185,6 +185,20 @@ def test_strip_think(raw, expected):
     assert strip_think(raw) == expected
 
 
+def test_stripping_cannot_recover_an_answer_started_inside_think():
+    # MiniMax-AI/MiniMax-M3#28: the answer's opening words land inside <think>. No stripping rule can
+    # tell them from reasoning, which is why answer generation runs with thinking disabled.
+    raw = "<think>\nI should greet them in Spanish.¡Hola! 👋 ¿Cómo\n</think>\n\nestás?"
+    assert strip_think(raw) == "estás?"
+
+
+def test_answer_keeps_raw_model_output_for_evaluation():
+    raw = "<think>checking</think>You get 24 days [handbook.pdf, Page 3]."
+    assert generate_answer("q", CHUNKS, FakeModel(raw)).raw_output == raw
+    assert generate_answer("q", CHUNKS, FakeModel(ABSTAIN_TOKEN)).raw_output == ABSTAIN_TOKEN
+    assert generate_answer("q", CHUNKS, FakeModel("uncited")).raw_output == "uncited"
+
+
 def test_citations_inside_think_are_ignored():
     reply = "<think>maybe [other.pdf, Page 99]?</think>Leave is 24 days [handbook.pdf, Page 3]."
     answer = generate_answer("q", CHUNKS, FakeModel(reply))
@@ -223,6 +237,17 @@ def test_client_sends_openai_compatible_request():
     assert seen["url"] == f"{BASE}/chat/completions"
     assert seen["auth"] == f"Bearer {KEY}"
     assert seen["body"] == {"model": MINIMAX_MODEL, "messages": messages, "max_tokens": GENERATION_MAX_TOKENS}
+
+
+def test_client_can_disable_thinking():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return ok("Hi")
+
+    minimax_client(KEY, BASE, thinking=False, transport=httpx.MockTransport(handler), sleep=lambda s: None)([])
+    assert seen["body"]["thinking"] == {"type": "disabled"}
 
 
 @pytest.mark.parametrize(

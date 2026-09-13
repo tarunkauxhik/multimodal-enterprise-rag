@@ -34,6 +34,7 @@ from rag.config import (
     EMBED_CACHE_PATH,
     EMBED_TASK_DOCUMENT,
     EMBED_TASK_QUERY,
+    GENERATION_THINKING,
     UNDERSTAND_CACHE_PATH,
     UNDERSTAND_MAX_TOKENS,
     load_settings,
@@ -73,7 +74,7 @@ def build_services() -> Services:
         embed_document=gemini_embedder(s.gemini_api_key, EMBED_TASK_DOCUMENT),
         embed_query=gemini_embedder(s.gemini_api_key, EMBED_TASK_QUERY),
         rerank=jina_reranker(s.jina_api_key),
-        answer_model=minimax_client(s.minimax_api_key, s.minimax_base_url),
+        answer_model=minimax_client(s.minimax_api_key, s.minimax_base_url, thinking=GENERATION_THINKING),
         understand_model=minimax_client(s.minimax_api_key, s.minimax_base_url, max_tokens=UNDERSTAND_MAX_TOKENS),
         secrets=tuple(k for k in (s.minimax_api_key, s.gemini_api_key, s.jina_api_key, s.qdrant_api_key) if k),
     )

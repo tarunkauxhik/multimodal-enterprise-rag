@@ -22,7 +22,7 @@ PDF
 | Sparse | `rank-bm25`, separate local/in-memory index (V1) |
 | Fusion | RRF in app code, k=60; dense top 20 + BM25 top 20 → top 10 |
 | Rerank | `jina-reranker-v3`, RRF top 10 → top 5 |
-| Generation | MiniMax-M3 over the top 5 chunks |
+| Generation | MiniMax-M3 over the top 5 chunks, thinking disabled (`GENERATION_THINKING`; see MiniMax-AI/MiniMax-M3#28) |
 | Citations | `[document.pdf, Page X]` (validated against supplied chunks); bare `[Page X]` accepted only when exactly one supplied document has that page |
 
 All of these live as constants in `rag/config.py`.
@@ -66,7 +66,7 @@ Local Qdrant: Docker container `rag-qdrant` on 127.0.0.1:6333, volume `rag_qdran
 - Embedding cache: `data/cache/embeddings.sqlite`, keyed by sha256(model, dim, task, text). Cached texts are never re-embedded.
 - IDs: `document_id` = sha256(PDF bytes)[:16]; `chunk_id` = `{document_id}-p{page}-{n}`; Qdrant point id = uuid5(chunk_id).
 - Re-ingesting a document upserts its points, then deletes that document's stale points.
-- Generation (`rag.generate.generate_answer(query, [hit.payload for hit in hits], minimax_client(...))`): retrieved text is sent only as delimited untrusted `<source>` blocks; `<think>` is stripped; `[document, Page N]` citations not matching a supplied (document, page) are removed; no context, `INSUFFICIENT_CONTEXT`, or no valid citation → abstention.
+- Generation (`rag.generate.generate_answer(query, [hit.payload for hit in hits], minimax_client(...))`): retrieved text is sent only as delimited untrusted `<source>` blocks; `<think>` is stripped; `[document, Page N]` citations not matching a supplied (document, page) are removed; no context, `INSUFFICIENT_CONTEXT`, or no valid citation → abstention. Answers use M3 with thinking disabled because M3 can start the answer inside `<think>` (MiniMax-AI/MiniMax-M3#28), which stripping cannot recover; page understanding keeps thinking on (a boundary defect there only causes a safe fallback). `Answer.raw_output` keeps the unprocessed reply for evaluation.
 - The rank-bm25 index is built in memory from Qdrant chunk payloads (`rag.bm25.build_bm25(rag.store.iter_payloads(client))`), so it never drifts from the dense index. Rebuild after ingestion.
 
 ## Code navigation
