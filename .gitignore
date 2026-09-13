@@ -1,0 +1,48 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+data/*
+!data/.gitkeep
+
+# Vector database
+qdrant_storage/
+storage/
+
+# Generated / processed files
+*.json
+*.jsonl
+*.pkl
+*.pickle
+
+# Uploaded documents
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
