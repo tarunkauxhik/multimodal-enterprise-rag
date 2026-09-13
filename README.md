@@ -1,99 +1,156 @@
 # Multimodal Enterprise RAG
 
-A document question-answering prototype for enterprise PDFs: upload reports in English or Hindi, ask questions in English, Hindi or Hinglish, and get answers grounded only in those documents with `[document.pdf, Page N]` citations. Pages that plain text extraction cannot handle (scans, charts, maps, broken tables) are selectively read by a multimodal model.
+Question answering over enterprise PDFs. Upload English or Hindi reports, ask in English, Hindi or Hinglish, and get answers grounded only in those documents, with validated `[document.pdf, Page N]` citations.
 
-## Architecture
+**Live:** [tarun.runs-on.dev](https://tarun.runs-on.dev)  
+**Stack:** Python 3.12 · Streamlit · Qdrant · PyMuPDF4LLM · MiniMax-M3 · Gemini Embedding 2 · rank-bm25 · Jina Reranker v3
 
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph Ingest
+        P[PDF] --> X[PyMuPDF4LLM<br/>fast extraction]
+        X --> R{Hard page?}
+        R -- no --> C[Structure-aware<br/>chunking]
+        R -- yes --> M[MiniMax-M3<br/>page vision] --> C
+        C --> E[Gemini Embedding 2<br/>768d]
+        E --> Q[(Qdrant)]
+    end
+
+    subgraph Query
+        U[Question] --> D[Dense top 20]
+        U --> B[BM25 top 20]
+        D --> F[RRF k=60<br/>top 10]
+        B --> F
+        F --> J[Jina rerank<br/>top 5]
+        J --> G[MiniMax-M3<br/>grounded answer]
+        G --> V[Citation check]
+        V --> A[Answer + citations<br/>or abstain]
+    end
+
+    Q --> D
+    Q -. chunk payloads .-> B
 ```
-PDF
- → PyMuPDF4LLM fast extraction (layout-aware blocks per page)
- → selective MiniMax-M3 page understanding (only scanned / garbled / informational-figure / sparse-table pages)
- → structure-aware chunking (never across pages; section path, tables and figures kept)
- → Gemini Embedding 2 (768 dims, cached)
- → Qdrant (dense, cosine)  +  rank-bm25 (in memory, built from the same Qdrant chunks)
- → Reciprocal Rank Fusion (k=60): dense top 20 + BM25 top 20 → top 10
- → Jina reranker v3 → top 5
- → MiniMax-M3 grounded answer with validated citations
+
+1. **Extract** every page quickly with PyMuPDF4LLM into typed blocks (heading, text, table, figure, caption).
+2. **Route** only hard pages to MiniMax-M3 vision; everything else keeps the fast extraction.
+3. **Chunk** by structure: chunks never cross pages, keep their section path, and tables and figures stay whole.
+4. **Embed** with Gemini Embedding 2 (768d, cached in SQLite) and store in Qdrant (cosine).
+5. **Retrieve** with dense search plus BM25, fuse by rank with RRF, rerank with Jina.
+6. **Answer** with MiniMax-M3 from the top 5 chunks, then validate every citation.
+
+## Selective multimodal understanding
+
+Sending every page to a vision model is slow: a 9-page M3 batch took about 30 s. So a page goes to M3 only when a deterministic check says fast extraction may have lost something:
+
+| Signal | Rule | M3 output stored as |
+|---|---|---|
+| Scanned | < 50 non-space characters and an image covering ~40% of the page | `figure` blocks |
+| Garbled | ≥ 1% U+FFFD replacement characters | re-transcribed `text` |
+| Informational figure | large figure whose caption is not an event photo ("Glimpses…", "Hon'ble…", "…held at…") | figure content |
+| Broken table | ≥ 50% of data cells empty | `table` |
+
+Pages are rendered at 150 DPI. M3 output is stored as **document content, never as an answer**, then chunked and embedded like any other block. If M3 fails, the fast extraction is kept. Results are cached in `data/cache/understanding.sqlite`.
+
+## Retrieval and grounding
+
+- **Hybrid search.** Dense retrieval handles paraphrase and cross-language queries; BM25 catches exact names, numbers and terms. Its tokenizer is Unicode-aware, so Devanagari words stay whole.
+- **One source of truth.** The BM25 index is rebuilt in memory from the chunks stored in Qdrant, so the two indexes cannot drift.
+- **RRF over ranks.** Dense and BM25 scores are not comparable, so they are fused by rank (k=60).
+- **Untrusted context.** Retrieved text is sent inside delimited `<source>` blocks, with the rules restated after it, so instructions hidden in a PDF are ignored.
+- **Citation validation.** Each `[document, Page N]` must match a retrieved chunk. A bare `[Page N]` is accepted only if exactly one document has that page. Invalid citations are removed; if none remain, the system answers `INSUFFICIENT_CONTEXT`.
+- **Thinking disabled for answers.** M3 can start its answer inside `<think>` ([MiniMax-M3#28](https://github.com/MiniMax-AI/MiniMax-M3/issues/28)), which would cut the opening words, so answers run with thinking off.
+
+## Design choices
+
+| Component | Chosen | Tried | Why |
+|---|---|---|---|
+| PDF extraction | PyMuPDF4LLM (~6.6 s) | Docling (56–185 s) | Docling was accurate but too slow for a prototype |
+| Vision | MiniMax-M3 | MiniMax-M2.7 | M2.7 failed the tested charts and images |
+| Embeddings | Gemini Embedding 2 (19 chunks ~1.7 s) | BGE-M3, BGE-small/base, Qwen3-Embedding-0.6B | Local models too slow or English-focused |
+| Reranker | Jina Reranker v3 (19 pairs ~1.45 s) | BGE reranker v2-m3, Voyage | Too slow locally / rate limits |
+| Orchestration | Plain Python modules | — | No LangChain, LangGraph or FastAPI; the pipeline is linear and easy to debug |
+
+Other decisions:
+
+- **Idempotent ingestion.** `document_id` is the first 16 hex characters of the PDF's SHA-256, and chunk and point IDs derive from it. Re-ingesting upserts, then deletes stale chunks. Cached embeddings are never recomputed, so an interrupted ingestion resumes cheaply.
+- **Session isolation.** Each browser session gets its own Qdrant collection, deleted after 24 h of inactivity. The CLI uses a separate shared `documents` collection that the app never reads.
+
+## Project structure
+
+```text
+app.py              Streamlit UI
+rag/
+  config.py         models, constants, settings from env
+  extract.py        PDF -> typed page blocks
+  understand.py     page routing + MiniMax-M3 vision
+  chunk.py          structure-aware chunks with metadata
+  embed.py          Gemini embeddings + SQLite cache
+  store.py          Qdrant collection and upserts
+  bm25.py           Unicode-aware BM25
+  retrieve.py       dense + BM25 -> RRF -> rerank
+  rerank.py         Jina client
+  generate.py       grounded prompt, citation validation, M3 client
+  ingest.py         ingestion pipeline + CLI
+  session.py        per-session collections and cleanup
+tests/              offline pytest suite
+evals/              30-question gold set
 ```
 
-| Module | Role |
-|---|---|
-| `rag/extract.py` | PDF → pages of typed blocks (heading, text, table, figure, caption) |
-| `rag/understand.py` | Page routing and MiniMax-M3 visual extraction, merged back into blocks |
-| `rag/chunk.py` | Structure-aware chunks with document, page, section and content-type metadata |
-| `rag/embed.py` | Gemini embeddings with a persistent SQLite cache and retries |
-| `rag/store.py` | Qdrant collection, idempotent upserts |
-| `rag/bm25.py` | Unicode-aware tokenizer (keeps Devanagari words whole) and BM25 search |
-| `rag/retrieve.py` | Dense + BM25 → RRF → Jina rerank |
-| `rag/rerank.py` | Jina reranker client |
-| `rag/generate.py` | Grounded prompt, citation validation, abstention, MiniMax client |
-| `rag/ingest.py` | Ingestion pipeline and CLI |
-| `rag/session.py` | Per-browser-session collections, activity tracking, cleanup |
-| `app.py` | Streamlit UI |
+## Run locally
 
-## Stack
-
-Python 3.12 · [uv](https://docs.astral.sh/uv/) · Streamlit · Qdrant · PyMuPDF4LLM · MiniMax-M3 (OpenAI-compatible gateway) · Gemini Embedding 2 · Jina Reranker v3 · rank-bm25 · httpx · pytest. No LangChain, LangGraph, FastAPI or Redis.
-
-## Local setup
-
-Prerequisites: Python 3.12 via `uv`, and Docker for Qdrant.
+Requires [uv](https://docs.astral.sh/uv/) and Docker.
 
 ```bash
 uv sync
-
-# Qdrant, bound to localhost, with a persistent volume
-docker run -d --name rag-qdrant -p 127.0.0.1:6333:6333 -v rag_qdrant_storage:/qdrant/storage qdrant/qdrant:latest
-
-cp .env.example .env   # then fill in the keys
-
-uv run streamlit run app.py    # run from the repo root; opens http://127.0.0.1:8501
+docker run -d --name rag-qdrant -p 127.0.0.1:6333:6333 \
+  -v rag_qdrant_storage:/qdrant/storage qdrant/qdrant:latest
+cp .env.example .env          # fill in the API keys
+uv run streamlit run app.py   # http://127.0.0.1:8501
 ```
 
-### Environment variables
+Qdrant must be running before the app starts.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `MINIMAX_API_KEY` | yes | MiniMax-M3 page understanding and answers |
-| `MINIMAX_BASE_URL` | no (defaults to the project gateway) | OpenAI-compatible MiniMax endpoint |
-| `GEMINI_API_KEY` | yes | Gemini Embedding 2 |
-| `JINA_API_KEY` | yes | Jina reranker |
-| `QDRANT_URL` | no (default `http://127.0.0.1:6333`) | Qdrant endpoint |
-| `QDRANT_API_KEY` | no | Only if Qdrant requires a key |
-| `STREAMLIT_SERVER_ADDRESS` / `_PORT` / `_MAX_UPLOAD_SIZE` | no | Override `.streamlit/config.toml` (default `127.0.0.1:8501`, 200 MB) |
+| `MINIMAX_API_KEY` | yes | Page understanding and answers |
+| `GEMINI_API_KEY` | yes | Embeddings |
+| `JINA_API_KEY` | yes | Reranking |
+| `MINIMAX_BASE_URL` | no | OpenAI-compatible MiniMax endpoint |
+| `QDRANT_URL` | no | Default `http://127.0.0.1:6333` |
+| `QDRANT_API_KEY` | no | Only if Qdrant requires one |
 
-Keys are read only from the environment (or a local `.env`, which is gitignored) and are redacted from any error shown in the UI.
-
-### Other commands
+Keys are read only from the environment or a gitignored `.env`, and are redacted from errors shown in the UI.
 
 ```bash
-uv run pytest                               # offline test suite (fake services, in-memory Qdrant)
-uv run python -m rag.ingest file.pdf ...    # CLI ingestion into the shared "documents" collection
-uv run python -m rag.retrieve "question"    # CLI retrieval over the shared collection
-RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s   # live multilingual retrieval test
+uv run pytest                               # offline suite: 143 passed, 7 live tests skipped
+uv run python -m rag.ingest file.pdf ...    # CLI ingestion (shared collection)
+uv run python -m rag.retrieve "question"    # CLI retrieval
+RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s
 ```
 
-## Major design decisions
+The live test sends English, Hindi, Hinglish and cross-language queries through real Gemini, Qdrant and Jina. One Hinglish → Devanagari case is marked `xfail` because Jina demotes the correct chunk out of first place.
 
-- **Selective multimodal understanding.** Fast extraction handles every page. Only pages with strong evidence go to MiniMax-M3: little text plus a page-sized image (scan), U+FFFD-garbled text, a large figure whose caption is not an event-photo caption, or a mostly empty table. M3 output is stored as document content (figure/table blocks), never used as an answer. Failures fall back to the fast extraction, and results are cached.
-- **Hybrid retrieval with one source of truth.** BM25 is rebuilt in memory from the chunks stored in Qdrant, so the sparse and dense indexes cannot drift. RRF fuses by rank, not score.
-- **Grounded generation.** Retrieved text is sent as delimited untrusted data, with source tags neutralised and rules restated after it, so instructions inside documents are ignored. Every `[document, Page N]` citation is checked against the retrieved chunks; unknown citations are removed and reported, and an answer with no valid citation becomes an abstention (`INSUFFICIENT_CONTEXT`).
-- **M3 thinking disabled for answers.** With thinking on, M3 can start its answer inside `<think>` ([MiniMax-M3#28](https://github.com/MiniMax-AI/MiniMax-M3/issues/28)), so stripping the reasoning would drop the opening words. `<think>` stripping stays as a safety net; raw output is kept for debugging but never shown.
-- **Session isolation without accounts.** Each browser session ingests into and searches its own Qdrant collection, named on the server. Last activity is stored in collection metadata; collections idle for 24 hours are deleted. The CLI uses a separate shared collection that the app never reads.
-- **Idempotent, cached ingestion.** Document IDs are content hashes, chunk and point IDs are derived from them, and embeddings and M3 page results are cached, so re-ingesting a PDF does not re-embed or re-call M3.
-- **Localhost by default.** The app has no authentication, so Streamlit binds to `127.0.0.1`.
+## Deployment
 
-## Evaluation data
+```text
+Internet -> Nginx (HTTPS, Let's Encrypt) -> Streamlit 127.0.0.1:8501 -> Qdrant 127.0.0.1:6333
+                                                    |
+                                                    +-> MiniMax, Gemini, Jina APIs
+```
 
-`evals/gold.jsonl` is a 30-question gold set (English, Hindi, Hinglish, cross-language, tables, visual pages, unanswerable and prompt-injection cases) built from three public annual reports. See [evals/README.md](evals/README.md). The source PDFs are not committed, and an evaluation runner is not part of this prototype yet.
+Runs on an OCI VM with Docker and systemd. Streamlit and Qdrant both bind to localhost; only Nginx is public. The app has no authentication, so access control belongs at the proxy.
 
-## Known limitations
+## Evaluation
 
-- **No authentication.** Session isolation is not access control. On a server, keep Streamlit on localhost behind a reverse proxy with TLS and access control, or use an SSH tunnel.
-- **Legacy Hindi fonts are unreadable.** PDFs set in non-Unicode Hindi fonts (e.g. Arjun, BHARTIYA-HINDI_081) extract as Latin gibberish and are not detected as garbled, so they are neither re-read by M3 nor usefully searchable.
-- **Unicode Hindi extraction is lossy.** PyMuPDF drops parts of some conjunct characters and doubles some vowel signs, which weakens Hindi keyword (BM25) matching; numbers usually survive.
-- **Page routing is heuristic.** Uncaptioned photos and decorative full-page images are still sent to M3; vector-drawn charts without an embedded image are not detected. Thresholds are not yet tuned on real corpora.
-- **Hinglish reranking.** Jina reranker v3 can demote a correct romanised-Hindi → Devanagari match (one known case in the live test is marked `xfail`).
-- **Refreshing the page starts a new, empty session.** The old documents are removed by the 24-hour inactivity cleanup.
-- **Single process, not load-tested.** API clients are shared across Streamlit sessions on the assumption that they are thread-safe; ingestion runs inside the uploading user's session.
-- **Not yet evaluated end to end.** The gold set exists, but retrieval and answer quality have not been measured on it.
+[`evals/gold.jsonl`](evals/gold.jsonl) holds 30 questions over three public annual reports: English, Hindi, Hinglish, cross-language, tables, visual pages, unanswerable questions and prompt injection. The PDFs are not committed. No end-to-end score (accuracy, Recall@K, faithfulness) is claimed yet; the set exists so those can be measured reproducibly.
+
+## Limitations
+
+- No authentication; session isolation is not access control.
+- Legacy non-Unicode Hindi fonts (e.g. Arjun, BHARTIYA-HINDI_081) extract as Latin gibberish and are not flagged as garbled.
+- Unicode Hindi extraction drops parts of some conjuncts and doubles some vowel signs, which weakens BM25.
+- Routing thresholds are heuristic: uncaptioned or decorative images can still reach M3, and vector-drawn charts are missed.
+- Refreshing the page starts a new, empty session.
+- Single process, not load-tested.
