@@ -8,7 +8,7 @@ from qdrant_client import QdrantClient
 from rag.chunk import chunk_document
 from rag.config import EMBED_DIM, QDRANT_COLLECTION
 from rag.embed import EmbeddingCache
-from rag.extract import Block, Page, extract_pdf
+from rag.extract import Block, Document, Page, extract_pdf
 from rag.ingest import ingest_pdf
 from rag.store import iter_payloads
 from rag.understand import (
@@ -71,7 +71,7 @@ def test_image_only_page_without_blocks_is_scanned():
     assert plan.transcribe and plan.reasons == ("scanned",)
     merged = merge_page(page, plan, {"page_text": "Invoice 42\n\nTotal due: 900"})
     assert merged.number == 3 and merged.largest_image_area == 500_990
-    assert [(b.kind, b.text) for b in merged.blocks] == [("text", "Invoice 42"), ("text", "Total due: 900")]
+    assert [(b.kind, b.text) for b in merged.blocks] == [("figure", "Invoice 42"), ("figure", "Total due: 900")]
 
 
 def test_large_figure_is_described_but_logo_is_not():
@@ -89,7 +89,7 @@ def test_short_caption_with_chart_is_described_not_transcribed():
     assert not plan.transcribe and plan.figures == (1,) and plan.reasons == ("figure",)
 
 
-def test_real_image_only_page_is_detected_as_scanned():
+def image_only_pdf() -> bytes:
     source = pymupdf.open()
     text_page = source.new_page()
     for i in range(12):
@@ -97,8 +97,43 @@ def test_real_image_only_page_is_detected_as_scanned():
     scan = pymupdf.open()
     page = scan.new_page(width=text_page.rect.width, height=text_page.rect.height)
     page.insert_image(page.rect, pixmap=text_page.get_pixmap(dpi=100))  # page is now just an image
-    doc = extract_pdf(scan.tobytes(), "scan.pdf")
+    return scan.tobytes()
+
+
+def test_real_image_only_page_is_detected_as_scanned():
+    doc = extract_pdf(image_only_pdf(), "scan.pdf")
     assert plan_page(doc.pages[0]).reasons == ("scanned",)
+
+
+def test_image_only_pdf_page_becomes_figure_chunks_via_mocked_m3():
+    data = image_only_pdf()
+    doc = extract_pdf(data, "scan.pdf")
+    m3 = FakeM3('{"page_text": "ACICs in India\\n\\nTotal ACICs: 17\\n\\n| State | ACICs |\\n|---|---|\\n| Tamil Nadu | 3 |"}')
+    enriched, report = understand_document(doc, data, m3)
+
+    assert report.understood == [1] and len(m3.calls) == 1
+    assert m3.calls[0][1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    chunks = chunk_document(enriched)
+    assert [(c.content_type, c.text) for c in chunks] == [
+        ("figure", "ACICs in India"),
+        ("figure", "Total ACICs: 17"),
+        ("table", "| State | ACICs |\n|---|---|\n| Tamil Nadu | 3 |"),
+    ]
+    assert all((c.document_id, c.source_name, c.page_number) == (doc.document_id, "scan.pdf", 1) for c in chunks)
+
+
+def test_ordinary_text_pages_never_call_m3():
+    pdf = pymupdf.open()
+    for n in range(3):
+        page = pdf.new_page()
+        for i in range(10):
+            page.insert_text((72, 80 + i * 18), f"Page {n} line {i}: employees receive paid leave and allowances.", fontsize=11)
+    data = pdf.tobytes()
+    doc = extract_pdf(data, "text.pdf")
+    m3 = FakeM3(RuntimeError("M3 must not be called for text pages"))
+    enriched, report = understand_document(doc, data, m3)
+    assert m3.calls == [] and report.understood == [] and report.failed == []
+    assert enriched is doc
 
 
 def test_garbled_text_is_transcribed_and_figures_still_described():
@@ -159,10 +194,44 @@ def test_transcription_replaces_garbled_text_keeps_described_figure():
     ]
 
 
-def test_scanned_page_transcription_drops_the_scan_image():
+def test_scanned_page_content_becomes_figure_blocks_replacing_the_scan_image():
     page = Page(2, [blk("figure", "", (0, 0, 612, 792))])
-    merged = merge_page(page, plan_page(page), {"page_text": "Invoice 42\n\nTotal due: 900"})
-    assert [(b.kind, b.text) for b in merged.blocks] == [("text", "Invoice 42"), ("text", "Total due: 900")]
+    merged = merge_page(page, plan_page(page), {"page_text": "Invoice 42\n\nTotal due: 900\n\n| Item | Rs |\n|---|---|\n| Pump | 900 |"})
+    assert [(b.kind, b.text) for b in merged.blocks] == [
+        ("figure", "Invoice 42"),
+        ("figure", "Total due: 900"),
+        ("table", "| Item | Rs |\n|---|---|\n| Pump | 900 |"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Glimpses from workshop on Strengthening PACS held at Pune",
+        "Hon’ble Prime Minister with CMs/LGs of States/UTs at the 10th Governing Council Meeting",
+        "Dr. Hanif Qureshi, Additional Secretary, addressed a media briefing on the PLI Auto Scheme.",
+        "राज्यों में आयोजित संपूर्णता अभियान सम्मान समारोह की झलकियाँ",
+    ],
+)
+def test_event_photo_pages_are_not_sent_to_m3(caption):
+    page = Page(1, [blk("text", PROSE), blk("figure", "", BIG), blk("caption", caption)])
+    assert not plan_page(page).needed
+
+
+def test_chart_or_map_with_informational_caption_is_sent():
+    page = Page(1, [blk("text", PROSE), blk("figure", "", BIG), blk("caption", "ACICs in India: state-wise distribution")])
+    assert plan_page(page).figures == (1,)
+
+
+def test_scanned_page_keeps_document_page_and_section_metadata():
+    doc = Document("doc9", "annual.pdf", [Page(1, [blk("heading", "Annexure-I", level=1), blk("text", PROSE)]), Page(2, [], largest_image_area=500_990)])
+    plan = plan_page(doc.pages[1])
+    merged = merge_page(doc.pages[1], plan, {"page_text": "Organogram of the Ministry\n\nShri A, Joint Secretary"})
+    chunks = chunk_document(Document(doc.document_id, doc.source_name, [doc.pages[0], merged]))
+    figure_chunks = [c for c in chunks if c.content_type == "figure"]
+    assert [c.text for c in figure_chunks] == ["Organogram of the Ministry", "Shri A, Joint Secretary"]
+    for c in figure_chunks:
+        assert (c.document_id, c.source_name, c.page_number, c.section_path) == ("doc9", "annual.pdf", 2, ("Annexure-I",))
 
 
 def test_sparse_table_replaced_keeping_position():

@@ -4,14 +4,16 @@ The fast PyMuPDF4LLM extraction stays the default. Only pages whose extraction
 is likely incomplete are rendered and sent to M3, for these reasons:
 - scanned: almost no extracted text, and an image covering most of the page
 - garbled: extracted text contains U+FFFD (missing font mappings, common for Devanagari)
-- figure:  a figure large enough to carry content (logos and icons are skipped)
+- figure:  a figure large enough to carry content (logos and icons are skipped) whose
+           caption does not read like an event photo ("Glimpses from…", "Hon'ble …")
 - table:   a table whose Markdown is mostly empty cells
 
-M3's JSON reply is merged into new Block objects for the same page number:
-scanned/garbled pages get their text replaced by M3's transcription, figures
-get descriptions, sparse tables are re-extracted. Any failure keeps the page's
-original extraction. Successful results are cached so re-ingestion is stable
-and does not call M3 again.
+M3's reply is extracted document content, never an answer. It is merged into new
+Block objects for the same page number: scanned pages become figure blocks (tables
+stay table blocks), garbled pages get their text replaced, figures get their visual
+content, sparse tables are re-extracted. Any failure keeps the page's original
+extraction. Successful results are cached so re-ingestion is stable and does not
+call M3 again.
 """
 
 import hashlib
@@ -38,12 +40,20 @@ SCAN_FIGURE_AREA = 200_000  # pt², about 40% of an A4/Letter page: treated as a
 GARBLED_RATIO = 0.01  # share of U+FFFD in extracted text
 SPARSE_TABLE_RATIO = 0.5  # share of empty cells in data rows
 REPLACEMENT_CHAR = chr(0xFFFD)
-PROMPT_VERSION = 1  # bump when the prompt or merge rules change; invalidates cached results
+# ponytail: caption keywords as the photo signal; add an image-complexity check if uncaptioned photos cost too much
+PHOTO_CAPTION = re.compile(
+    r"\b(glimpses?|hon[’']?ble|inaugurat|launch|releas|meeting|visit|workshop|seminar|conclave|ceremony|"
+    r"felicitat|interact|chairing|address|briefing|delegation|signing|organi[sz]ed|held (at|in|on))"
+    r"|झलक|माननीय|बैठक|विमोचन|शुभारंभ|कार्यशाला|आयोजित",
+    re.I,
+)
+PROMPT_VERSION = 2  # bump when the prompt or merge rules change; invalidates cached results
 
 NO_BBOX = (0, 0, 0, 0)  # transcribed blocks have no reliable position
 
 SYSTEM_PROMPT = (
-    "You convert one PDF page image into text for a search index. "
+    "You extract factual content from one PDF page image for a search index. "
+    "Your output is stored as document content; it is not an answer to anyone. "
     'Reply with only a JSON object: {"page_text": string or null, '
     '"figures": [{"id": int, "description": string}], "tables": [{"id": int, "markdown": string}]}. '
     "Fill only what the tasks ask for, using the ids given. "
@@ -82,6 +92,12 @@ def _is_sparse_table(markdown: str) -> bool:
     return not cells or sum(not cell for cell in cells) / len(cells) >= SPARSE_TABLE_RATIO
 
 
+def _is_event_photo(blocks: list[Block], i: int) -> bool:
+    """A figure whose adjacent caption reads like an event photo, e.g. "Glimpses from … held at Pune"."""
+    captions = [blocks[j].text for j in (i - 1, i + 1) if 0 <= j < len(blocks) and blocks[j].kind == "caption"]
+    return any(PHOTO_CAPTION.search(caption) for caption in captions)
+
+
 def plan_page(page: Page) -> PagePlan:
     text = "".join(b.text for b in page.blocks if b.kind != "figure")
     chars = len("".join(text.split()))
@@ -98,8 +114,12 @@ def plan_page(page: Page) -> PagePlan:
         reasons.append("garbled")
     transcribe = bool(reasons)
 
-    # A page scan is transcribed, not described; other large figures are still described.
-    figures = tuple(i for i in large_figures if i not in scans) if "scanned" in reasons else large_figures
+    # A page scan is transcribed, not described; other large figures are described unless they are event photos.
+    figures = tuple(
+        i
+        for i in large_figures
+        if not ("scanned" in reasons and i in scans) and not _is_event_photo(page.blocks, i)
+    )
     tables = () if transcribe else tuple(
         i for i, b in enumerate(page.blocks) if b.kind == "table" and _is_sparse_table(b.text)
     )
@@ -117,11 +137,12 @@ def build_messages(page: Page, plan: PagePlan, png: bytes, scale: float) -> list
     tasks = []
     if plan.transcribe:
         tasks.append(
-            "page_text: transcribe all text on the page in reading order as Markdown. "
-            "Render tables as Markdown tables and describe any chart or photo in one sentence where it appears."
+            "page_text: extract all factual content on the page in reading order as Markdown: text, tables as "
+            "Markdown tables, chart and graph values, map labels and numbers, diagram or organogram structure, captions."
         )
     tasks += [
-        f"figures id {i}: describe the figure at pixel box {box(i)}: what it shows, with all visible labels, numbers and trends."
+        f"figures id {i}: extract the factual content of the visual at pixel box {box(i)}: what it is (chart, map, "
+        "diagram, table, photo), every readable label, number, legend and trend, and its caption."
         for i in plan.figures
     ]
     tasks += [f"tables id {i}: re-extract the table at pixel box {box(i)} as a Markdown table with a header row." for i in plan.tables]
@@ -159,14 +180,14 @@ def _by_id(items: object, key: str) -> dict[int, str]:
     return out
 
 
-def _markdown_blocks(markdown: str) -> list[Block]:
-    """Split a transcription into table blocks (| lines) and paragraph text blocks."""
+def _markdown_blocks(markdown: str, prose_kind: str) -> list[Block]:
+    """Split a transcription into table blocks (| lines) and one `prose_kind` block per paragraph."""
     blocks: list[Block] = []
     lines: list[str] = []
-    kind = "text"
+    kind = prose_kind
     for raw in markdown.splitlines():
         line = raw.strip()
-        line_kind = "table" if line.startswith("|") else "text"
+        line_kind = "table" if line.startswith("|") else prose_kind
         if not line or line_kind != kind:
             if lines:
                 blocks.append(Block(kind, "\n".join(lines), NO_BBOX))
@@ -187,7 +208,9 @@ def merge_page(page: Page, plan: PagePlan, result: dict) -> Page | None:
     transcript = page_text.strip() if plan.transcribe and isinstance(page_text, str) else ""
 
     applied = bool(transcript)
-    blocks = _markdown_blocks(transcript) if transcript else []
+    # Content read from a scan is visual content (figure); a garbled text layer is still text.
+    prose_kind = "figure" if "scanned" in plan.reasons else "text"
+    blocks = _markdown_blocks(transcript, prose_kind) if transcript else []
     for i, block in enumerate(page.blocks):
         if transcript and i not in plan.figures:
             continue  # replaced by the transcription
