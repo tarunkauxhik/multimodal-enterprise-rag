@@ -43,7 +43,11 @@ All of these live as constants in `rag/config.py`.
 uv sync                                   # create .venv from pyproject/uv.lock
 uv run pytest                             # tests (offline; in-memory Qdrant, fake embedder)
 uv run python -m rag.ingest file.pdf ...  # extract -> chunk -> embed -> Qdrant (idempotent)
+uv run python -m rag.retrieve "question"  # hybrid retrieval, prints top 5 with citations
+RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s  # real Gemini/Jina/Qdrant, multilingual
 ```
+
+Local Qdrant: Docker container `rag-qdrant` on 127.0.0.1:6333, volume `rag_qdrant_storage`.
 
 ## Data flow notes
 

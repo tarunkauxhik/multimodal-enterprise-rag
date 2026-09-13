@@ -317,6 +317,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "google-genai" },
+    { name = "httpx" },
     { name = "pymupdf4llm" },
     { name = "qdrant-client" },
     { name = "rank-bm25" },
@@ -330,6 +331,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "google-genai", specifier = ">=2.23.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pymupdf4llm", specifier = ">=1.28.2" },
     { name = "qdrant-client", specifier = ">=1.19.0" },
     { name = "rank-bm25", specifier = ">=0.2.2" },
