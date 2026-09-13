@@ -29,8 +29,8 @@ qdrant_storage/
 storage/
 
 # Generated / processed files
-*.json
-*.jsonl
+# (JSON/JSONL outputs belong under data/, already ignored above; committed
+#  JSON such as eval sets and test fixtures must stay trackable)
 *.pkl
 *.pickle
 

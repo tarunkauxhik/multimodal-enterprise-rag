@@ -1,0 +1,16 @@
+[project]
+name = "multimodal-enterprise-rag"
+version = "0.1.0"
+description = "Multimodal enterprise RAG and document intelligence (V1: Streamlit + Qdrant)"
+requires-python = ">=3.12,<3.13"
+# Runtime dependencies are added in the step that first uses them.
+dependencies = [
+    "pymupdf4llm>=1.28.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
