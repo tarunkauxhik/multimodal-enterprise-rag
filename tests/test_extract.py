@@ -38,6 +38,11 @@ def test_figure_and_caption_detected_with_bbox(extracted):
     assert caption.text.startswith("Figure 1")
 
 
+def test_largest_image_area_recorded_per_page(extracted):
+    assert extracted.pages[0].largest_image_area > 20_000  # the figure image
+    assert extracted.pages[1].largest_image_area == 0
+
+
 def test_page_text_stays_on_its_page(extracted):
     page1 = " ".join(b.text for b in extracted.pages[0].blocks)
     page2 = " ".join(b.text for b in extracted.pages[1].blocks)

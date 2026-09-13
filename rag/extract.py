@@ -31,6 +31,9 @@ class Block:
 class Page:
     number: int  # 1-based
     blocks: list[Block]
+    # Largest embedded image on the page (pt², clipped to the page). Layout mode returns no
+    # blocks at all for image-only (scanned) pages, so this is how they are recognised.
+    largest_image_area: int = 0
 
 
 @dataclass
@@ -62,9 +65,18 @@ def extract_pdf(data: bytes, source_name: str) -> Document:
             footer=False,
             show_progress=False,
         )
+        image_areas = [_largest_image_area(page) for page in doc]
 
-    pages = [Page(c["metadata"]["page_number"], _blocks(c)) for c in page_chunks]
+    pages = [
+        Page(c["metadata"]["page_number"], _blocks(c), image_areas[c["metadata"]["page_number"] - 1])
+        for c in page_chunks
+    ]
     return Document(document_id_for(data), source_name, pages)
+
+
+def _largest_image_area(page: pymupdf.Page) -> int:
+    areas = [(pymupdf.Rect(info["bbox"]) & page.rect).get_area() for info in page.get_image_info()]
+    return round(max(areas, default=0))
 
 
 def _blocks(page_chunk: dict) -> list[Block]:

@@ -13,10 +13,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"  # gitignored runtime data
 EMBED_CACHE_PATH = DATA_DIR / "cache" / "embeddings.sqlite"
+UNDERSTAND_CACHE_PATH = DATA_DIR / "cache" / "understanding.sqlite"
 
 # --- Benchmarked decisions (see CLAUDE.md before changing) ---
 MINIMAX_MODEL = "MiniMax-M3"
 GENERATION_MAX_TOKENS = 4096  # includes M3 <think> reasoning tokens; not benchmarked
+UNDERSTAND_MAX_TOKENS = 8192  # page transcription can be long; not benchmarked
+UNDERSTAND_DPI = 150  # page render resolution sent to M3 (~3.2k prompt tokens per page)
 
 GEMINI_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768

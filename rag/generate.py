@@ -135,6 +135,7 @@ def minimax_client(
     api_key: str,
     base_url: str,
     *,
+    max_tokens: int = GENERATION_MAX_TOKENS,
     attempts: int = 5,
     timeout: float = 120.0,
     transport: httpx.BaseTransport | None = None,
@@ -145,7 +146,7 @@ def minimax_client(
     )
 
     def complete(messages: list[dict]) -> str:
-        body = {"model": MINIMAX_MODEL, "messages": messages, "max_tokens": GENERATION_MAX_TOKENS}
+        body = {"model": MINIMAX_MODEL, "messages": messages, "max_tokens": max_tokens}
         error = ""
         for attempt in range(attempts):
             retryable = True
@@ -168,7 +169,7 @@ def minimax_client(
                 else:
                     choice = data["choices"][0]
                     if choice.get("finish_reason") == "length":
-                        raise RuntimeError(f"MiniMax response truncated at max_tokens={GENERATION_MAX_TOKENS}")
+                        raise RuntimeError(f"MiniMax response truncated at max_tokens={max_tokens}")
                     return choice["message"].get("content") or ""
             if not retryable:
                 break

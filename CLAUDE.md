@@ -51,6 +51,7 @@ Local Qdrant: Docker container `rag-qdrant` on 127.0.0.1:6333, volume `rag_qdran
 
 ## Data flow notes
 
+- Multimodal understanding (`rag.understand`): after fast extraction, only pages flagged `scanned` (little text + large image), `garbled` (U+FFFD in text), `figure` (large figure) or `table` (mostly empty cells) are rendered at 150 DPI and sent to MiniMax-M3. Results merge into new blocks on the same page; any failure keeps the fast extraction. Successful results are cached in `data/cache/understanding.sqlite` (bump `PROMPT_VERSION` to invalidate).
 - Embedding cache: `data/cache/embeddings.sqlite`, keyed by sha256(model, dim, task, text). Cached texts are never re-embedded.
 - IDs: `document_id` = sha256(PDF bytes)[:16]; `chunk_id` = `{document_id}-p{page}-{n}`; Qdrant point id = uuid5(chunk_id).
 - Re-ingesting a document upserts its points, then deletes that document's stale points.
