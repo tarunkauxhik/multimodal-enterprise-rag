@@ -1,0 +1,75 @@
+"""Ingest PDFs: extract -> chunk -> embed (cached) -> Qdrant.
+
+Usage: uv run python -m rag.ingest path/to/file.pdf [more.pdf ...]
+
+Idempotent: document and chunk ids are content-derived, embeddings are cached,
+and re-ingesting a document replaces its points in place. The BM25 index is
+rebuilt from Qdrant by the app, so ingestion does not touch it.
+"""
+
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from qdrant_client import QdrantClient
+
+from rag.chunk import chunk_document
+from rag.config import EMBED_CACHE_PATH, EMBED_TASK_DOCUMENT, load_settings
+from rag.embed import EmbedBatch, EmbeddingCache, embed_texts, gemini_embedder
+from rag.extract import extract_pdf
+from rag.store import ensure_collection, replace_document
+
+
+@dataclass
+class IngestResult:
+    document_id: str
+    source_name: str
+    pages: int
+    chunks: int
+    newly_embedded: int
+
+
+def ingest_pdf(
+    data: bytes, source_name: str, *, client: QdrantClient, embed_batch: EmbedBatch, cache: EmbeddingCache
+) -> IngestResult:
+    doc = extract_pdf(data, source_name)
+    chunks = chunk_document(doc)
+    vectors, newly_embedded = embed_texts([c.text for c in chunks], EMBED_TASK_DOCUMENT, embed_batch, cache)
+    ensure_collection(client)
+    replace_document(client, doc.document_id, chunks, vectors)
+    return IngestResult(doc.document_id, source_name, len(doc.pages), len(chunks), newly_embedded)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Ingest PDFs into Qdrant.")
+    parser.add_argument("pdfs", nargs="+", type=Path)
+    args = parser.parse_args(argv)
+
+    settings = load_settings()
+    client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    embed_batch = gemini_embedder(settings.gemini_api_key, EMBED_TASK_DOCUMENT)
+    cache = EmbeddingCache(EMBED_CACHE_PATH)
+
+    failed = 0
+    try:
+        for path in args.pdfs:
+            try:
+                r = ingest_pdf(path.read_bytes(), path.name, client=client, embed_batch=embed_batch, cache=cache)
+            except (OSError, ValueError) as exc:  # bad file: report and continue with the rest
+                print(f"FAILED {path}: {exc}", file=sys.stderr)
+                failed += 1
+                continue
+            print(
+                f"{r.source_name}: document_id={r.document_id} pages={r.pages} "
+                f"chunks={r.chunks} newly_embedded={r.newly_embedded}"
+            )
+            if r.chunks == 0:
+                print(f"  warning: no text extracted from {r.source_name} (scanned PDF?)", file=sys.stderr)
+    finally:
+        cache.close()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

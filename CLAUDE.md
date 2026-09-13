@@ -40,9 +40,17 @@ All of these live as constants in `rag/config.py`.
 ## Commands
 
 ```
-uv sync                 # create .venv from pyproject/uv.lock
-uv run pytest           # tests
+uv sync                                   # create .venv from pyproject/uv.lock
+uv run pytest                             # tests (offline; in-memory Qdrant, fake embedder)
+uv run python -m rag.ingest file.pdf ...  # extract -> chunk -> embed -> Qdrant (idempotent)
 ```
+
+## Data flow notes
+
+- Embedding cache: `data/cache/embeddings.sqlite`, keyed by sha256(model, dim, task, text). Cached texts are never re-embedded.
+- IDs: `document_id` = sha256(PDF bytes)[:16]; `chunk_id` = `{document_id}-p{page}-{n}`; Qdrant point id = uuid5(chunk_id).
+- Re-ingesting a document upserts its points, then deletes that document's stale points.
+- The rank-bm25 index is built in memory from Qdrant chunk payloads (`rag.bm25.build_bm25(rag.store.iter_payloads(client))`), so it never drifts from the dense index. Rebuild after ingestion.
 
 ## Code navigation
 

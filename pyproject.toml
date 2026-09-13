@@ -5,7 +5,10 @@ description = "Multimodal enterprise RAG and document intelligence (V1: Streamli
 requires-python = ">=3.12,<3.13"
 # Runtime dependencies are added in the step that first uses them.
 dependencies = [
+    "google-genai>=2.23.0",
     "pymupdf4llm>=1.28.2",
+    "qdrant-client>=1.19.0",
+    "rank-bm25>=0.2.2",
 ]
 
 [dependency-groups]
@@ -14,3 +17,5 @@ dev = ["pytest>=8"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Tests use in-memory Qdrant, where payload indexes are a no-op.
+filterwarnings = ["ignore:Payload indexes have no effect in the local Qdrant"]

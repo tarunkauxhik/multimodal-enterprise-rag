@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"  # gitignored runtime data
+EMBED_CACHE_PATH = DATA_DIR / "cache" / "embeddings.sqlite"
 
 # --- Benchmarked decisions (see CLAUDE.md before changing) ---
 MINIMAX_MODEL = "MiniMax-M3"
@@ -19,6 +21,7 @@ GEMINI_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768
 EMBED_TASK_DOCUMENT = "RETRIEVAL_DOCUMENT"
 EMBED_TASK_QUERY = "RETRIEVAL_QUERY"
+EMBED_BATCH_SIZE = 5  # sized for our Gemini API quota; 429s are retried with backoff
 
 JINA_RERANK_MODEL = "jina-reranker-v3"
 
