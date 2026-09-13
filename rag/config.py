@@ -16,6 +16,7 @@ EMBED_CACHE_PATH = DATA_DIR / "cache" / "embeddings.sqlite"
 
 # --- Benchmarked decisions (see CLAUDE.md before changing) ---
 MINIMAX_MODEL = "MiniMax-M3"
+GENERATION_MAX_TOKENS = 4096  # includes M3 <think> reasoning tokens; not benchmarked
 
 GEMINI_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768

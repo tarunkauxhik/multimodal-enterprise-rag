@@ -54,6 +54,7 @@ Local Qdrant: Docker container `rag-qdrant` on 127.0.0.1:6333, volume `rag_qdran
 - Embedding cache: `data/cache/embeddings.sqlite`, keyed by sha256(model, dim, task, text). Cached texts are never re-embedded.
 - IDs: `document_id` = sha256(PDF bytes)[:16]; `chunk_id` = `{document_id}-p{page}-{n}`; Qdrant point id = uuid5(chunk_id).
 - Re-ingesting a document upserts its points, then deletes that document's stale points.
+- Generation (`rag.generate.generate_answer(query, [hit.payload for hit in hits], minimax_client(...))`): retrieved text is sent only as delimited untrusted `<source>` blocks; `<think>` is stripped; `[Page N]` citations to pages not supplied are removed; no context, `INSUFFICIENT_CONTEXT`, or no valid citation → abstention.
 - The rank-bm25 index is built in memory from Qdrant chunk payloads (`rag.bm25.build_bm25(rag.store.iter_payloads(client))`), so it never drifts from the dense index. Rebuild after ingestion.
 
 ## Code navigation
