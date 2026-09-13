@@ -29,7 +29,10 @@ EMBED_BATCH_SIZE = 5  # sized for our Gemini API quota; 429s are retried with ba
 
 JINA_RERANK_MODEL = "jina-reranker-v3"
 
-QDRANT_COLLECTION = "documents"  # cosine distance, EMBED_DIM vectors
+# Shared collection for CLI ingestion/retrieval (rag.ingest, rag.retrieve). The Streamlit app never
+# uses it: each browser session gets its own collection (rag.session), so CLI-ingested documents
+# do not appear in the app. Cosine distance, EMBED_DIM vectors.
+QDRANT_COLLECTION = "documents"
 
 DENSE_TOP_K = 20
 BM25_TOP_K = 20

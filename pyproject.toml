@@ -10,6 +10,7 @@ dependencies = [
     "pymupdf4llm>=1.28.2",
     "qdrant-client>=1.19.0",
     "rank-bm25>=0.2.2",
+    "streamlit>=1.63.0",
 ]
 
 [dependency-groups]

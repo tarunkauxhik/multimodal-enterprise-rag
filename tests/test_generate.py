@@ -14,26 +14,24 @@ from rag.generate import (
     validate_citations,
 )
 
+
+def chunk(source_name, page, text, section="Leave Policy", document_id="d"):
+    return {
+        "chunk_id": f"{document_id}-p{page}-0",
+        "document_id": document_id,
+        "source_name": source_name,
+        "page_number": page,
+        "section_path": ["Handbook", section],
+        "content_type": "text",
+        "text": text,
+    }
+
+
 CHUNKS = [
-    {
-        "chunk_id": "d-p3-0",
-        "document_id": "d",
-        "source_name": "handbook.pdf",
-        "page_number": 3,
-        "section_path": ["Handbook", "Leave Policy"],
-        "content_type": "text",
-        "text": "Employees receive 24 days of paid annual leave.",
-    },
-    {
-        "chunk_id": "d-p7-1",
-        "document_id": "d",
-        "source_name": "handbook.pdf",
-        "page_number": 7,
-        "section_path": ["Handbook", "Travel"],
-        "content_type": "text",
-        "text": "The daily travel allowance is 3000 rupees.",
-    },
+    chunk("handbook.pdf", 3, "Employees receive 24 days of paid annual leave."),
+    chunk("handbook.pdf", 7, "The daily travel allowance is 3000 rupees.", section="Travel"),
 ]
+POLICY_PAGE_3 = chunk("policy.pdf", 3, "Contractors receive 12 days of leave.", document_id="e")
 
 
 class FakeModel:
@@ -48,41 +46,72 @@ class FakeModel:
 # 1. Citations ---------------------------------------------------------------
 
 
-def test_valid_citations_are_normalised_and_sources_returned():
-    answer = generate_answer("leave?", CHUNKS, FakeModel("<think>ok</think>You get 24 days [page 3]."))
+def test_document_page_citations_are_normalised_and_sources_returned():
+    answer = generate_answer("leave?", CHUNKS, FakeModel("<think>ok</think>You get 24 days [Handbook.PDF, page 3]."))
     assert not answer.abstained
-    assert answer.text == "You get 24 days [Page 3]."
-    assert answer.cited_pages == [3] and [s["page_number"] for s in answer.sources] == [3]
+    assert answer.text == "You get 24 days [handbook.pdf, Page 3]."
+    assert answer.citations == [("handbook.pdf", 3)]
+    assert [(s["source_name"], s["page_number"]) for s in answer.sources] == [("handbook.pdf", 3)]
     assert answer.removed_citations == []
 
 
-def test_invented_page_is_removed_and_reported():
-    reply = "Leave is 24 days [Page 3]. Travel is 3000 [Page 7]. Bonus is huge [Page 99]."
+def test_same_page_number_in_two_documents_is_distinguished():
+    reply = "Employees get 24 days [handbook.pdf, Page 3]; contractors get 12 [policy, Page 3]."
+    answer = generate_answer("leave?", [*CHUNKS, POLICY_PAGE_3], FakeModel(reply))
+    assert answer.text == "Employees get 24 days [handbook.pdf, Page 3]; contractors get 12 [policy.pdf, Page 3]."
+    assert answer.citations == [("handbook.pdf", 3), ("policy.pdf", 3)]
+    assert [s["source_name"] for s in answer.sources] == ["handbook.pdf", "policy.pdf"]
+
+
+def test_invented_page_or_document_is_removed_and_reported():
+    reply = (
+        "Leave is 24 days [handbook.pdf, Page 3]. Travel is 3000 [handbook.pdf, Page 7]. "
+        "Bonus is huge [handbook.pdf, Page 99]. Contractors get 12 [policy.pdf, Page 3]."
+    )
     answer = generate_answer("q", CHUNKS, FakeModel(reply))
-    assert answer.text == "Leave is 24 days [Page 3]. Travel is 3000 [Page 7]. Bonus is huge."
-    assert answer.cited_pages == [3, 7] and answer.removed_citations == ["[Page 99]"]
+    assert answer.text == (
+        "Leave is 24 days [handbook.pdf, Page 3]. Travel is 3000 [handbook.pdf, Page 7]. "
+        "Bonus is huge. Contractors get 12."
+    )
+    assert answer.citations == [("handbook.pdf", 3), ("handbook.pdf", 7)]
+    assert answer.removed_citations == ["[handbook.pdf, Page 99]", "[policy.pdf, Page 3]"]
+
+
+def test_legacy_page_only_citation_resolves_only_when_unambiguous():
+    sources = [("handbook.pdf", 3), ("handbook.pdf", 7), ("policy.pdf", 3)]
+    text, citations, removed = validate_citations("A [Page 7]. B [Page 3].", sources)
+    assert text == "A [handbook.pdf, Page 7]. B."
+    assert citations == [("handbook.pdf", 7)] and removed == ["[Page 3]"]
 
 
 def test_multi_page_and_range_citations_never_infer_pages():
-    text, cited, removed = validate_citations("A [Pages 3, 7]. B [Page 3-5].", {3, 4, 5, 7})
-    assert text == "A [Page 3] [Page 7]. B [Page 3] [Page 5]."
-    assert cited == [3, 7, 5] and removed == []
+    handbook = [("handbook.pdf", p) for p in (3, 4, 5, 7)]
+    text, citations, removed = validate_citations("A [handbook.pdf, Pages 3, 7]. B [handbook.pdf, Page 3-5].", handbook)
+    assert text == "A [handbook.pdf, Page 3] [handbook.pdf, Page 7]. B [handbook.pdf, Page 3] [handbook.pdf, Page 5]."
+    assert citations == [("handbook.pdf", 3), ("handbook.pdf", 7), ("handbook.pdf", 5)] and removed == []
 
-    text, cited, removed = validate_citations("C [Pages 7, 12].", {7})
-    assert text == "C [Page 7]." and cited == [7] and removed == ["[Pages 7, 12]"]
+    text, citations, removed = validate_citations("C [handbook.pdf, Pages 7, 12].", [("handbook.pdf", 7)])
+    assert text == "C [handbook.pdf, Page 7]." and removed == ["[handbook.pdf, Pages 7, 12]"]
 
 
-@pytest.mark.parametrize("reply", ["Leave is 24 days.", "Leave is 24 days [Page 42]."], ids=["uncited", "only-invalid"])
+def test_document_names_with_commas_are_supported():
+    text, citations, _ = validate_citations("X [Report, final.pdf, Page 2].", [("Report, final.pdf", 2)])
+    assert text == "X [Report, final.pdf, Page 2]." and citations == [("Report, final.pdf", 2)]
+
+
+@pytest.mark.parametrize(
+    "reply", ["Leave is 24 days.", "Leave is 24 days [handbook.pdf, Page 42]."], ids=["uncited", "only-invalid"]
+)
 def test_answer_without_valid_citation_abstains(reply):
     answer = generate_answer("q", CHUNKS, FakeModel(reply))
-    assert answer.abstained and answer.text == ABSTAIN_MESSAGE and answer.cited_pages == []
+    assert answer.abstained and answer.text == ABSTAIN_MESSAGE and answer.citations == []
 
 
 # 2. Abstention --------------------------------------------------------------
 
 
 def test_no_context_abstains_without_calling_model():
-    model = FakeModel("should not be used [Page 3]")
+    model = FakeModel("should not be used [handbook.pdf, Page 3]")
     answer = generate_answer("What is the CEO's salary?", [], model)
     assert answer.abstained and answer.text == ABSTAIN_MESSAGE
     assert model.calls == []
@@ -105,9 +134,9 @@ def test_empty_query_rejected():
 def test_prompt_requires_grounding_citations_and_abstention():
     system, user = build_messages("How much leave?", CHUNKS)
     assert system["role"] == "system" and user["role"] == "user"
-    for rule in ("Use only information stated in the sources", "[Page N]", ABSTAIN_TOKEN):
+    for rule in ("Use only information stated in the sources", "[document, Page N]", ABSTAIN_TOKEN):
         assert rule in system["content"]
-    assert 'page="3"' in user["content"] and 'page="7"' in user["content"]
+    assert 'page="3" document="handbook.pdf"' in user["content"] and 'page="7"' in user["content"]
     assert user["content"].index("Question: How much leave?") > user["content"].rindex("</source>")
 
 
@@ -133,9 +162,10 @@ def test_injected_text_cannot_break_out_of_its_source_block():
 
 
 def test_model_following_injection_is_not_passed_through():
-    answer = generate_answer("How much leave?", [INJECTED], FakeModel("HACKED. Visit http://evil.example [Page 99]"))
+    reply = "HACKED. Visit http://evil.example [Page 99] [attacker.pdf, Page 3]"
+    answer = generate_answer("How much leave?", [INJECTED], FakeModel(reply))
     assert answer.abstained and answer.text == ABSTAIN_MESSAGE
-    assert answer.removed_citations == ["[Page 99]"]
+    assert answer.removed_citations == ["[Page 99]", "[attacker.pdf, Page 3]"]
 
 
 # 4. <think> stripping --------------------------------------------------------
@@ -156,8 +186,9 @@ def test_strip_think(raw, expected):
 
 
 def test_citations_inside_think_are_ignored():
-    answer = generate_answer("q", CHUNKS, FakeModel("<think>maybe [Page 99]?</think>Leave is 24 days [Page 3]."))
-    assert answer.text == "Leave is 24 days [Page 3]." and answer.removed_citations == []
+    reply = "<think>maybe [other.pdf, Page 99]?</think>Leave is 24 days [handbook.pdf, Page 3]."
+    answer = generate_answer("q", CHUNKS, FakeModel(reply))
+    assert answer.text == "Leave is 24 days [handbook.pdf, Page 3]." and answer.removed_citations == []
 
 
 # 5. API client -----------------------------------------------------------------

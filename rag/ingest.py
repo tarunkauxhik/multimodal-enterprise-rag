@@ -5,11 +5,16 @@ Usage: uv run python -m rag.ingest path/to/file.pdf [more.pdf ...]
 Idempotent: document and chunk ids are content-derived, embeddings and M3 page
 results are cached, and re-ingesting a document replaces its points in place.
 The BM25 index is rebuilt from Qdrant by the app, so ingestion does not touch it.
+
+The CLI always writes to the shared QDRANT_COLLECTION ("documents"). The Streamlit
+app calls ingest_pdf with its own per-session collection instead (rag.session),
+so documents ingested here are not visible in the app.
 """
 
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,6 +24,7 @@ from rag.chunk import chunk_document
 from rag.config import (
     EMBED_CACHE_PATH,
     EMBED_TASK_DOCUMENT,
+    QDRANT_COLLECTION,
     UNDERSTAND_CACHE_PATH,
     UNDERSTAND_MAX_TOKENS,
     load_settings,
@@ -50,17 +56,29 @@ def ingest_pdf(
     cache: EmbeddingCache,
     complete: Complete | None = None,
     understanding_cache: UnderstandingCache | None = None,
+    collection: str = QDRANT_COLLECTION,
+    on_stage: Callable[[str], None] | None = None,
 ) -> IngestResult:
-    """Ingest one PDF. Without `complete`, only the fast extraction path is used."""
+    """Ingest one PDF. Without `complete`, only the fast extraction path is used.
+
+    `on_stage` receives a short human-readable message as each stage starts.
+    """
+    stage = on_stage or (lambda message: None)
+
+    stage("Extracting text and layout")
     doc = extract_pdf(data, source_name)
     understood, failed = [], []
     if complete is not None:
+        stage("Checking for figures, tables and scanned pages (MiniMax M3 where needed)")
         doc, report = understand_document(doc, data, complete, understanding_cache)
         understood, failed = report.understood, report.failed
+    stage("Chunking by structure")
     chunks = chunk_document(doc)
+    stage(f"Embedding {len(chunks)} chunks")
     vectors, newly_embedded = embed_texts([c.text for c in chunks], EMBED_TASK_DOCUMENT, embed_batch, cache)
-    ensure_collection(client)
-    replace_document(client, doc.document_id, chunks, vectors)
+    stage("Storing in the vector database")
+    ensure_collection(client, collection)
+    replace_document(client, doc.document_id, chunks, vectors, collection)
     return IngestResult(doc.document_id, source_name, len(doc.pages), len(chunks), newly_embedded, understood, failed)
 
 
