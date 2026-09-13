@@ -73,6 +73,16 @@ def test_fresh_session_gets_private_collection_and_explains_lifetime(monkeypatch
     assert "command-line tool are not shown here" in notes
 
 
+def test_ask_is_disabled_until_a_document_is_ready(monkeypatch, fake_services, sample_pdf):
+    empty = run_app(monkeypatch, fake_services)
+    assert next(b for b in empty.button if b.label == "Ask").disabled
+    assert empty.text_input(key="question").disabled
+
+    st.cache_resource.clear()
+    ready = run_app(monkeypatch, fake_services, session_with_sample(fake_services, sample_pdf))
+    assert not next(b for b in ready.button if b.label == "Ask").disabled
+
+
 def test_two_app_sessions_get_different_collections(monkeypatch, fake_services):
     first = run_app(monkeypatch, fake_services)
     second = run_app(monkeypatch, fake_services)
@@ -87,9 +97,13 @@ def test_question_shows_answer_document_page_citations_and_chunks(monkeypatch, f
     assert not at.exception and not at.error
     markdown = [md.value for md in at.markdown]
     assert "Revenue was 120 in 2025 [sample.pdf, Page 1]." in markdown
-    assert any(md.startswith("- **[sample.pdf, Page 1]**") for md in markdown)
-    assert at.expander[0].label.startswith("Retrieved source chunks (")
-    assert any("[sample.pdf, Page 1]**" in md and md.startswith("**1.") for md in markdown)
+    assert "**Sources cited**" in markdown and "**sample.pdf** · Page 1" in markdown  # citation card
+    assert at.expander[0].label.startswith("All retrieved chunks (")
+    assert any(md.startswith("**1. sample.pdf** · Page ") for md in markdown)  # retrieved-chunk card
+    captions = " ".join(c.value for c in at.caption)
+    assert "text" in captions or "table" in captions or "figure" in captions  # content type shown on cards
+    assert any("Year" in t.value or "Revenue" in t.value for t in at.text)  # snippet shown as plain text
+    assert not any("<think>" in md for md in markdown)
 
 
 def test_using_the_app_refreshes_session_activity(monkeypatch, fake_services, sample_pdf):

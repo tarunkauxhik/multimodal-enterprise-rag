@@ -1,0 +1,10 @@
+# Store text with LF line endings in the repository and working tree (avoids Windows CRLF noise).
+* text=auto eol=lf
+
+# Binary files: never touch line endings.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.sqlite binary
+*.zst binary

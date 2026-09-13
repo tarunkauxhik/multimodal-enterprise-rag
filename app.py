@@ -150,6 +150,21 @@ def sidebar(services: session.Services) -> None:
             st.rerun()
 
 
+SNIPPET_CHARS = 500
+
+
+def source_card(title: str, chunks: list[dict], detail: str = "") -> None:
+    """Bordered card: document and page, content type and section, then the chunk text."""
+    first = chunks[0]
+    types = ", ".join(sorted({c["content_type"] for c in chunks}))
+    sections = "; ".join(sorted({" › ".join(c["section_path"]) for c in chunks} - {""}))
+    text = "\n\n".join(c["text"] for c in chunks)
+    with st.container(border=True):
+        st.markdown(f"**{title}** · Page {first['page_number']}")
+        st.caption(" · ".join(part for part in (types, sections, detail) if part))
+        st.text(text if len(text) <= SNIPPET_CHARS else text[:SNIPPET_CHARS] + "…")  # plain text: nothing in documents is rendered
+
+
 def render_result(question: str, answer, hits) -> None:
     st.subheader("Answer")
     st.caption(f"Question: {question}")
@@ -161,41 +176,39 @@ def render_result(question: str, answer, hits) -> None:
         st.caption(f"{len(answer.removed_citations)} citation(s) to sources outside the retrieved context were removed.")
 
     if answer.citations:
-        st.markdown("**Citations**")
+        st.markdown("**Sources cited**")
         for document, page in answer.citations:
-            sections = sorted(
-                {" › ".join(s["section_path"]) for s in answer.sources if (s["source_name"], s["page_number"]) == (document, page)}
-                - {""}
-            )
-            st.markdown(f"- **[{document}, Page {page}]**" + (f" — {'; '.join(sections)}" if sections else ""))
+            chunks = [s for s in answer.sources if (s["source_name"], s["page_number"]) == (document, page)]
+            source_card(document, chunks)
 
-    with st.expander(f"Retrieved source chunks ({len(hits)})", expanded=answer.abstained):
+    with st.expander(f"All retrieved chunks ({len(hits)})", expanded=answer.abstained):
         if not hits:
             st.caption("No matching chunks were found in this session's documents.")
         for rank, hit in enumerate(hits, start=1):
-            p = hit.payload
-            section = " › ".join(p["section_path"])
-            st.markdown(f"**{rank}. [{p['source_name']}, Page {p['page_number']}]**" + (f" — {section}" if section else ""))
-            st.caption(
-                f"{p['content_type']} · rerank {hit.rerank_score:.3f} · RRF {hit.rrf_score:.4f} · "
-                f"dense rank {hit.dense_rank or '–'} · BM25 rank {hit.bm25_rank or '–'}"
+            source_card(
+                f"{rank}. {hit.payload['source_name']}",
+                [hit.payload],
+                detail=f"rerank {hit.rerank_score:.3f} · dense rank {hit.dense_rank or '–'} · BM25 rank {hit.bm25_rank or '–'}",
             )
-            st.markdown(p["text"])  # HTML in document text is not rendered
-            st.divider()
 
 
 def ask(services: session.Services) -> None:
     state = st.session_state
     st.title("Document Q&A")
     st.caption("Answers come only from the PDFs uploaded in this browser session, cited as [document, Page N].")
-    if not state.documents:
+    has_documents = bool(state.documents)
+    if not has_documents:
         st.info("Upload one or more PDFs in the sidebar to start asking questions.")
-        return
 
     with st.form("ask"):
-        question = st.text_input("Question", key="question", placeholder="e.g. How many days of paid leave do employees get?")
-        submitted = st.form_submit_button("Ask", type="primary")
-    if submitted:
+        question = st.text_input(
+            "Question",
+            key="question",
+            placeholder="e.g. How many days of paid leave do employees get?",
+            disabled=not has_documents,
+        )
+        submitted = st.form_submit_button("Ask", type="primary", disabled=not has_documents)
+    if submitted and has_documents:
         if not question.strip():
             st.warning("Please enter a question.")
         else:
