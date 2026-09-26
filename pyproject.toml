@@ -1,7 +1,7 @@
 [project]
 name = "multimodal-enterprise-rag"
 version = "0.1.0"
-description = "Multimodal enterprise RAG and document intelligence (V1: Streamlit + Qdrant)"
+description = "Multimodal enterprise RAG and document intelligence (FastAPI + Qdrant; Next.js frontend in web/)"
 requires-python = ">=3.12,<3.13"
 # Runtime dependencies are added in the step that first uses them.
 dependencies = [
@@ -13,7 +13,6 @@ dependencies = [
     "python-multipart>=0.0.32",
     "qdrant-client>=1.19.0",
     "rank-bm25>=0.2.2",
-    "streamlit>=1.63.0",
     "uvicorn>=0.52.4",
 ]
 

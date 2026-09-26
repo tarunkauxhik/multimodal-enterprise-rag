@@ -70,7 +70,7 @@ def document_id_for(data: bytes) -> str:
 
 
 def extract_pdf(data: bytes, source_name: str) -> Document:
-    """Extract a PDF (raw bytes, e.g. a Streamlit upload) into pages of blocks."""
+    """Extract a PDF (raw bytes, e.g. an HTTP upload) into pages of blocks."""
     try:
         doc = pymupdf.open(stream=data, filetype="pdf")
     except pymupdf.FileDataError as exc:

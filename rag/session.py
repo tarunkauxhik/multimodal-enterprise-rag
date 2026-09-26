@@ -1,25 +1,18 @@
-"""Session-scoped ingestion and question answering for the Streamlit app.
+"""Ingestion and question answering against one Qdrant collection, as used by the HTTP API (api.py).
 
-Two collection models, deliberately kept separate:
-- CLI (`python -m rag.ingest`) writes to the shared QDRANT_COLLECTION ("documents").
-- The Streamlit app uses one private collection per browser session, created here.
-  The app never reads the shared collection, so CLI-ingested documents never
-  appear in a session.
+build_services creates the API clients once; ingest_upload and answer_question run the
+unchanged rag/ pipeline against whichever collection the caller names. The API uses one
+shared collection (API_COLLECTION, default QDRANT_COLLECTION, the one the CLI writes to).
 
-Isolation: the session collection name is generated on the server and kept only
-in that session's state; ingestion, BM25 and dense search all run against it.
+Private, expiring collections (start_session, touch_session, cleanup_inactive_sessions,
+delete_session): each stores its last activity time in Qdrant collection metadata and is
+deleted after SESSION_TTL_SECONDS of inactivity. They served the former per-browser
+Streamlit app; the API does not use them.
 
-Lifetime: each session collection stores its last activity time in Qdrant
-collection metadata. Uploads, questions and ongoing app use refresh it, and
-collections inactive for SESSION_TTL_SECONDS are deleted whenever a new session
-starts. A browser refresh starts a new Streamlit session: the old collection stops
-being refreshed and is removed by the same inactivity cleanup.
-
-Threads: Streamlit runs each session on its own thread. The API clients in
-Services (httpx-based Jina and MiniMax clients, google-genai, qdrant-client) are
-shared across sessions on the assumption that they are safe for concurrent
-requests, which is their normal usage; this is not load-tested yet. SQLite caches
-are not shared: they are opened per operation.
+Threads: the API clients in Services (httpx-based Jina and MiniMax clients, google-genai,
+qdrant-client) are shared across request and ingestion threads on the assumption that they
+are safe for concurrent requests, which is their normal usage; this is not load-tested yet.
+SQLite caches are not shared: they are opened per operation.
 """
 
 import time
@@ -150,15 +143,6 @@ def unique_source_name(name: str, taken: Iterable[str]) -> str:
     while (candidate := f"{stem} ({n}){dot}{ext}") in taken:
         n += 1
     return candidate
-
-
-def upload_size_error(size_bytes: int, limit_mb: int) -> str | None:
-    if size_bytes > limit_mb * 1024 * 1024:
-        return (
-            f"File is {size_bytes / (1024 * 1024):.1f} MB, above the {limit_mb} MB upload limit "
-            "(server.maxUploadSize / STREAMLIT_SERVER_MAX_UPLOAD_SIZE)."
-        )
-    return None
 
 
 def ingest_upload(

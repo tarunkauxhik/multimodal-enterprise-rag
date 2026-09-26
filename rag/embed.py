@@ -42,7 +42,7 @@ class EmbedStats:
     transport_retries: int = 0  # our retry loop only; the SDK's own HTTP retries are not visible
 
 
-# The embedder is shared across Streamlit session threads, so retries are counted into the stats of
+# The embedder is shared across API request and ingestion threads, so retries are counted into the stats of
 # whichever embed_texts call is running in the current thread/context, never into a shared counter.
 _active_stats: ContextVar[EmbedStats | None] = ContextVar("active_embed_stats", default=None)
 

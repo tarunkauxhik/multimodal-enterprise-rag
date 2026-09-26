@@ -155,12 +155,6 @@ def test_unique_source_name_keeps_citations_unambiguous():
     assert session.unique_source_name("README", ["README"]) == "README (2)"
 
 
-def test_upload_size_error():
-    assert session.upload_size_error(200 * 1024 * 1024, 200) is None
-    message = session.upload_size_error(200 * 1024 * 1024 + 1, 200)
-    assert "above the 200 MB upload limit" in message and "STREAMLIT_SERVER_MAX_UPLOAD_SIZE" in message
-
-
 def test_answer_model_runs_with_thinking_disabled_understanding_keeps_default(monkeypatch):
     for name in ("MINIMAX_API_KEY", "GEMINI_API_KEY", "JINA_API_KEY"):
         monkeypatch.setenv(name, "test-key")

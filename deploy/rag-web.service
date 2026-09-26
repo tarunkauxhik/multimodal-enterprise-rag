@@ -1,0 +1,18 @@
+# Next.js frontend (standalone build: cd web && npm ci && npm run build). The only service Nginx proxies to.
+# Node.js 24 LTS; Next.js 16 needs >= 20.9 at runtime.
+[Unit]
+Description=Multimodal Enterprise RAG web app
+After=network-online.target rag-api.service
+Wants=network-online.target rag-api.service
+
+[Service]
+User=rag
+WorkingDirectory=/opt/multimodal-enterprise-rag/web/.next/standalone
+Environment=NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3000 RAG_API_URL=http://127.0.0.1:8000
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

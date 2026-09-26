@@ -173,7 +173,7 @@ def test_embedder_retries_outside_an_embed_texts_call_are_harmless(monkeypatch):
 
 
 def test_transport_retries_are_isolated_between_concurrent_ingestions(monkeypatch, tmp_path):
-    """Streamlit shares one embedder across session threads: each ingestion must count only its own retries."""
+    """The API shares one embedder across threads: each ingestion must count only its own retries."""
     lock, barrier = threading.Lock(), threading.Barrier(2, timeout=10)
     failures_left, started = {"a": 2, "b": 1}, set()
 

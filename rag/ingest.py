@@ -6,9 +6,8 @@ Idempotent: document and chunk ids are content-derived, embeddings and M3 page
 results are cached, and re-ingesting a document replaces its points in place.
 The BM25 index is rebuilt from Qdrant by the app, so ingestion does not touch it.
 
-The CLI always writes to the shared QDRANT_COLLECTION ("documents"). The Streamlit
-app calls ingest_pdf with its own per-session collection instead (rag.session),
-so documents ingested here are not visible in the app.
+The CLI always writes to the shared QDRANT_COLLECTION ("documents"), which is also
+the HTTP API's default workspace (api.py, through rag.session).
 
 Observability: every ingestion fills an IngestReport (routing, chunks, embedding,
 storage, per-stage timings). The caller may pass its own report so that it keeps the

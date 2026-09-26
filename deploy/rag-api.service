@@ -1,0 +1,20 @@
+# FastAPI backend: the application boundary. Localhost only; reached through the web app.
+# Keys come from /opt/multimodal-enterprise-rag/.env (read by rag.config.load_settings).
+[Unit]
+Description=Multimodal Enterprise RAG API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=rag
+WorkingDirectory=/opt/multimodal-enterprise-rag
+# Exactly one worker: upload jobs live in memory.
+ExecStart=/opt/multimodal-enterprise-rag/.venv/bin/uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=on-failure
+# Stopping waits for a running ingestion to finish.
+TimeoutStopSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

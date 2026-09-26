@@ -8,7 +8,7 @@ citation validation all live in rag/ and are called unchanged through rag.sessio
 Workspace: every client shares one Qdrant collection, API_COLLECTION (default "documents",
 the collection the CLI also writes to). There is no per-client isolation and no access
 control: do not expose this API publicly. Keep it on localhost behind a reverse proxy with
-TLS and access control, as for the Streamlit app.
+TLS and access control; the web frontend reaches it server-side.
 
 Ingestion runs in the background on exactly one worker thread: PDFs take minutes, far past
 proxy timeouts, and PyMuPDF must not run on several threads at once. At most one upload runs
