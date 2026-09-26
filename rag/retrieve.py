@@ -7,6 +7,10 @@ query -> Gemini query embedding (cached) -> Qdrant dense top 20
 Every Hit carries the full chunk payload (document, page, section, text) and
 the score and rank from each stage it appeared in.
 
+Only complete documents are searched: both BM25 and dense search are limited to
+points from finished writes (rag.store.complete_write_ids), so a document whose
+write was cut short by a failure or a restart never takes part.
+
 Usage: uv run python -m rag.retrieve "your question"
 """
 
@@ -15,7 +19,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 
 from rag.bm25 import Bm25Index, build_bm25
 from rag.config import (
@@ -31,7 +35,7 @@ from rag.config import (
 )
 from rag.embed import EmbedBatch, EmbeddingCache, embed_texts, gemini_embedder
 from rag.rerank import Rerank, jina_reranker
-from rag.store import ensure_collection, iter_payloads
+from rag.store import complete_write_ids, ensure_collection, iter_payloads
 
 
 @dataclass
@@ -88,15 +92,32 @@ class Retriever:
         self.collection = collection
         ensure_collection(client, collection)
         self.bm25: Bm25Index = build_bm25([])
+        self.complete_writes: set[str] = set()
         self.refresh_bm25()
 
     def refresh_bm25(self) -> None:
-        """Rebuild BM25 from the chunks in Qdrant. Call after ingestion."""
-        self.bm25 = build_bm25(iter_payloads(self.client, self.collection))
+        """Rebuild BM25 and the set of retrievable writes from the chunks in Qdrant. Call after ingestion.
+
+        Only documents whose stored points are one finished write (rag.store.complete_write_ids) are
+        searched, by BM25 and dense search alike, so a write cut short by a failure or a restart is
+        never retrieved. Derived from Qdrant on every refresh, so it holds across restarts.
+        """
+        payloads = list(iter_payloads(self.client, self.collection))
+        self.complete_writes = complete_write_ids(payloads)
+        self.bm25 = build_bm25(p for p in payloads if p.get("write_id") in self.complete_writes)
 
     def dense_search(self, query: str, top_k: int = DENSE_TOP_K) -> list[Hit]:
         (vector,), _ = embed_texts([query], EMBED_TASK_QUERY, self.embed_query, self.cache)
-        points = self.client.query_points(self.collection, query=vector, limit=top_k, with_payload=True).points
+        if not self.complete_writes:
+            return []
+        # Filtered in Qdrant, so the top_k come from complete documents only. A write that starts after
+        # the refresh has a new write_id, which is not in the set: its partial points stay invisible.
+        complete_only = models.Filter(
+            must=[models.FieldCondition(key="write_id", match=models.MatchAny(any=sorted(self.complete_writes)))]
+        )
+        points = self.client.query_points(
+            self.collection, query=vector, query_filter=complete_only, limit=top_k, with_payload=True
+        ).points
         return [Hit(p.payload, dense_score=p.score, dense_rank=rank) for rank, p in enumerate(points, start=1)]
 
     def bm25_search(self, query: str, top_k: int = BM25_TOP_K) -> list[Hit]:

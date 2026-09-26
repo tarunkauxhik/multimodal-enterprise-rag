@@ -29,7 +29,7 @@ All of these live as constants in `rag/config.py`.
 
 ## Rules
 
-- V1 stack: Python 3.12, Streamlit, Qdrant. No FastAPI, Next.js, LangChain, LangGraph, Redis, Kubernetes, or extra framework layers.
+- V1 stack: Python 3.12, Streamlit, Qdrant, plus `api.py`: a thin FastAPI adapter for a UI that holds no RAG logic (it calls `rag.session` and `rag.store`). No Next.js, LangChain, LangGraph, Redis, Celery, Kubernetes, or extra framework layers.
 - Add a dependency only in the step that needs it; prefer stdlib or already-installed packages.
 - API keys come only from environment variables (`rag.config.load_settings`). Never hardcode, print, or log them.
 - Never commit PDFs, databases, caches, model files, BM25 index files, or `.env`. Runtime data lives under `data/` (gitignored).
@@ -45,6 +45,7 @@ uv run pytest                             # tests (offline; in-memory Qdrant, fa
 uv run python -m rag.ingest file.pdf ...  # extract -> chunk -> embed -> Qdrant (idempotent)
 uv run python -m rag.retrieve "question"  # hybrid retrieval, prints top 5 with citations
 uv run streamlit run app.py               # demo app (run from repo root; binds 127.0.0.1:8501)
+uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1  # HTTP API prototype (single worker only)
 RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s  # real Gemini/Jina/Qdrant, multilingual
 ```
 
@@ -56,15 +57,17 @@ Local Qdrant: Docker container `rag-qdrant` on 127.0.0.1:6333, volume `rag_qdran
 - Overrides via environment: `STREAMLIT_SERVER_ADDRESS`, `STREAMLIT_SERVER_PORT`, `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` (MB, default 200). Oversized files are rejected with a clear message.
 - Keep Qdrant bound to localhost as well (`-p 127.0.0.1:6333:6333`).
 - Single app process assumed. API clients are shared across Streamlit session threads on the assumption they are thread-safe (normal usage for httpx, google-genai, qdrant-client); load-test during deployment.
+- The HTTP API (`api.py`) has no authentication and one shared workspace: bind it to `127.0.0.1` and put it behind the same proxy access control. Run exactly one Uvicorn worker (`--workers 1`): upload jobs live in memory. The proxy must cap request bodies (nginx `client_max_body_size 200M;`), since Starlette receives an upload in full before the API's own size check.
 
 ## Data flow notes
 
-- Two separate collection models: the CLI (`rag.ingest`, `rag.retrieve`) uses the shared `documents` collection; the Streamlit app uses one private collection per browser session and never reads `documents`. CLI-ingested documents do not appear in the app.
+- Two separate collection models: the CLI (`rag.ingest`, `rag.retrieve`) uses the shared `documents` collection; the Streamlit app uses one private collection per browser session and never reads `documents`. CLI-ingested documents do not appear in the app. The HTTP API (`api.py`) uses one shared workspace, `API_COLLECTION` (default `documents`), so CLI-ingested documents do appear there; it lists documents from Qdrant payloads (`rag.store.list_documents`, no chunk text) and runs ingestion on a single background thread (`ThreadPoolExecutor(max_workers=1)`), keeping each job's live `IngestReport` in memory.
 - App sessions (`rag.session`): each browser session ingests into and retrieves from its own collection `session_<created>_<uuid>` (name held only in server-side session state). Last activity is stored in the collection's Qdrant metadata and refreshed by uploads, questions and app use (at most once a minute); collections inactive for 24h are deleted when a new session starts. A browser refresh starts a new, empty Streamlit session; the abandoned collection is removed by that inactivity cleanup. No accounts or persistence beyond this.
 - Within a session, duplicate file names get a " (2)" suffix so `[document, Page N]` citations stay unambiguous.
 - Multimodal understanding (`rag.understand`): after fast extraction, only pages flagged `scanned` (little text + large image), `garbled` (U+FFFD in text), `legacy_font` (at least half the page's Latin letters in a known pre-Unicode Hindi font such as Arjun or Kruti Dev, read from the PDF's text spans into `Page.legacy_font_share`), `legacy_text` (fallback when no listed font matches: Latin text with few vowels and punctuation inside words), `figure` (large figure whose caption is not an event-photo caption such as "Glimpses…", "Hon'ble…", "…held at…") or `table` (mostly empty cells) are rendered at 150 DPI and sent to MiniMax-M3. M3 output is stored as extracted document content (never an answer): scanned pages become `figure` blocks (tables stay `table`), figures get their visual content, garbled and legacy pages are re-transcribed as `text`. Any failure keeps the fast extraction. Successful results are cached in `data/cache/understanding.sqlite` (bump `PROMPT_VERSION` to invalidate).
 - Embedding cache: `data/cache/embeddings.sqlite`, keyed by sha256(model, dim, task, text). Cached texts are never re-embedded.
 - IDs: `document_id` = sha256(PDF bytes)[:16]; `chunk_id` = `{document_id}-p{page}-{n}`; Qdrant point id = uuid5(chunk_id).
+- Completeness: `replace_document` stamps every point with `chunk_total` and a per-write `write_id` (keyword-indexed). A document is complete only when all its points share one `write_id` and their count equals `chunk_total` (`rag.store.complete_write_ids`, the single definition). `list_documents` reports anything else as incomplete (the API's `incomplete`), and `Retriever.refresh_bm25` derives the set of complete writes from Qdrant on every refresh: BM25 indexes only their chunks and dense search filters `write_id` to that set, so a partial or interrupted write is never retrieved, across restarts too. Points stored before these fields existed are therefore not retrieved until re-ingested (idempotent and cached). The fields never reach prompts or API responses.
 - Re-ingesting a document upserts its points, then deletes that document's stale points.
 - Generation (`rag.generate.generate_answer(query, [hit.payload for hit in hits], minimax_client(...))`): retrieved text is sent only as delimited untrusted `<source>` blocks; `<think>` is stripped; `[document, Page N]` citations not matching a supplied (document, page) are removed; no context, `INSUFFICIENT_CONTEXT`, or no valid citation → abstention. Answers use M3 with thinking disabled because M3 can start the answer inside `<think>` (MiniMax-AI/MiniMax-M3#28), which stripping cannot recover; page understanding keeps thinking on (a boundary defect there only causes a safe fallback). `Answer.raw_output` keeps the unprocessed reply for evaluation.
 - The rank-bm25 index is built in memory from Qdrant chunk payloads (`rag.bm25.build_bm25(rag.store.iter_payloads(client))`), so it never drifts from the dense index. Rebuild after ingestion.

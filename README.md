@@ -71,7 +71,7 @@ Pages are rendered at 150 DPI. M3 output is stored as **document content, never 
 | Vision | MiniMax-M3 | MiniMax-M2.7 | M2.7 failed the tested charts and images |
 | Embeddings | Gemini Embedding 2 (19 chunks ~1.7 s) | BGE-M3, BGE-small/base, Qwen3-Embedding-0.6B | Local models too slow or English-focused |
 | Reranker | Jina Reranker v3 (19 pairs ~1.45 s) | BGE reranker v2-m3, Voyage | Too slow locally / rate limits |
-| Orchestration | Plain Python modules | — | No LangChain, LangGraph or FastAPI; the pipeline is linear and easy to debug |
+| Orchestration | Plain Python modules | — | No LangChain or LangGraph; the pipeline is linear and easy to debug. FastAPI is only a thin HTTP adapter (`api.py`) |
 
 Other decisions:
 
@@ -82,6 +82,7 @@ Other decisions:
 
 ```text
 app.py              Streamlit UI
+api.py              HTTP API for a UI (FastAPI adapter, single-workspace prototype)
 rag/
   config.py         models, constants, settings from env
   extract.py        PDF -> typed page blocks
@@ -125,13 +126,35 @@ Qdrant must be running before the app starts.
 Keys are read only from the environment or a gitignored `.env`, and are redacted from errors shown in the UI.
 
 ```bash
-uv run pytest                               # offline suite: 143 passed, 7 live tests skipped
+uv run pytest                               # offline suite; live tests are skipped
 uv run python -m rag.ingest file.pdf ...    # CLI ingestion (shared collection)
 uv run python -m rag.retrieve "question"    # CLI retrieval
 RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s
 ```
 
 The live test sends English, Hindi, Hinglish and cross-language queries through real Gemini, Qdrant and Jina. One Hinglish → Devanagari case is marked `xfail` because Jina demotes the correct chunk out of first place.
+
+## HTTP API (prototype)
+
+`api.py` exposes the same pipeline over HTTP for a UI. It is only an adapter: ingestion, retrieval, reranking, generation, prompts and citation validation are the unchanged `rag/` code.
+
+```bash
+uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1   # docs at http://127.0.0.1:8000/docs
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/health` | Qdrant reachability (never calls Gemini, Jina or MiniMax); 503 when Qdrant is down |
+| `GET /api/documents` | Documents in the workspace, derived from Qdrant payloads (no chunk text). Status: `ready`, `incomplete` (stored points from an unfinished write; upload again), `queued`, `processing`, `failed`, or `empty` (no extractable text) |
+| `POST /api/documents` | Multipart `file` (PDF). 202 queued; 200 if the identical PDF is already stored and complete (nothing is re-processed); 409 if it is queued, processing or being deleted; 429 if the queue is full; 413 too large; 415 not a PDF |
+| `DELETE /api/documents/{document_id}` | Removes all of a document's chunks; 404 unknown, 409 queued, processing or already being deleted. Uploads of that document get 409 until the deletion finishes |
+| `POST /api/chat` | `{"question": ...}` → `answer`, `abstained`, `citations` (`[document, Page N]` validated against the retrieved chunks), `sources`. Abstains exactly as the app does; raw model output is never returned. 503 if Qdrant fails, 502 if the embedder, reranker or answer model fails |
+
+- **Single workspace, no authentication.** Every client shares one Qdrant collection, `API_COLLECTION` (default `documents`, the one the CLI also writes to). There is no per-client isolation. Do not expose the API publicly: keep it on localhost behind a reverse proxy with TLS and access control.
+- **Background ingestion on one worker thread.** PDFs can take minutes, beyond proxy timeouts, and PyMuPDF must not run on several threads at once. At most one upload runs and one waits; further uploads get 429, so at most two PDFs are held in memory. Progress (`stage`, `pages`, `chunks`, `new_embeddings`, `error`) appears in `GET /api/documents`; a waiting upload shows stage `queued`.
+- **Completeness.** Every stored chunk carries its write's `chunk_total` and `write_id`. A document is `ready` only when all its points come from one write and their number matches `chunk_total`, so a write cut short by a failure or a restart shows as `incomplete`, never `ready`. Points stored before these fields existed also show as `incomplete` until uploaded again. Retrieval uses the same rule: dense search and BM25 only consider chunks of complete documents, so an `incomplete` document never contributes to an answer (the Streamlit app and the CLI included). While a document is being re-ingested it drops out of search until the new write finishes.
+- **One process.** Job state is in memory, so run a single Uvicorn worker; a restart forgets queued uploads (re-uploading is cheap: ingestion is idempotent and cached). Stopping the process waits for a running ingestion to finish.
+- `API_MAX_UPLOAD_MB` (default 200) limits upload size. Starlette receives the whole request before that check runs, so the reverse proxy must enforce the same limit, e.g. nginx `client_max_body_size 200M;`.
 
 ## Deployment
 

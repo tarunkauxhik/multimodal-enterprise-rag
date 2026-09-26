@@ -1,14 +1,14 @@
 import zlib
 
 import pytest
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 
-from rag.bm25 import tokenize
+from rag.bm25 import build_bm25, tokenize
 from rag.chunk import Chunk
 from rag.config import EMBED_DIM, EMBED_TASK_DOCUMENT
 from rag.embed import EmbeddingCache, embed_texts
 from rag.retrieve import Hit, Retriever, fuse, rrf
-from rag.store import ensure_collection, replace_document
+from rag.store import ensure_collection, iter_payloads, point_id, replace_document
 
 CITATION_FIELDS = {"chunk_id", "document_id", "source_name", "page_number", "section_path", "content_type", "text"}
 
@@ -172,6 +172,98 @@ def test_refresh_bm25_sees_newly_ingested_chunks(env):
     load(client, cache, make_chunks(["expense reimbursement within 30 days"], doc_id="doc2"), doc_id="doc2")
     retriever.refresh_bm25()
     assert [h.payload["document_id"] for h in retriever.bm25_search("reimbursement")] == ["doc2"]
+
+
+# --- only complete documents are retrievable --------------------------------------------
+
+
+def policy_texts(doc_id):
+    return [f"paid annual leave policy {doc_id} clause {i}" for i in range(3)]
+
+
+def docs_of(hits):
+    return {h.payload["document_id"] for h in hits}
+
+
+@pytest.fixture
+def mixed_corpus(env):
+    """Every document matches the query; only "complete" is one finished write."""
+    client, cache = env
+    for doc_id in ("complete", "truncated", "rewritten"):
+        load(client, cache, make_chunks(policy_texts(doc_id), doc_id), doc_id)
+    # a first write cut short: its last point never arrived
+    client.delete("documents", points_selector=models.PointIdsList(points=[point_id("truncated-p3-2")]), wait=True)
+    # an interrupted rewrite: same chunk count, but one point already carries the new write's id
+    client.set_payload("documents", payload={"write_id": "interrupted-rewrite"}, points=[point_id("rewritten-p1-0")])
+    # a point stored before chunk_total/write_id existed: completeness cannot be verified
+    legacy = {"chunk_id": "legacy-p1-0", "document_id": "legacy", "source_name": "legacy.pdf", "page_number": 1,
+              "section_path": ["Handbook"], "content_type": "text", "text": "paid annual leave policy legacy clause"}
+    client.upsert("documents", [models.PointStruct(id=point_id("legacy-p1-0"), vector=hash_embed([legacy["text"]])[0], payload=legacy)])
+    return client, cache
+
+
+QUERY = "paid annual leave policy clause"
+
+
+def test_complete_document_is_retrievable(mixed_corpus):
+    client, cache = mixed_corpus
+    retriever = Retriever(client, hash_embed, cache, FakeReranker())
+    assert docs_of(retriever.dense_search(QUERY)) == {"complete"}
+    assert docs_of(retriever.retrieve(QUERY)) == {"complete"}
+
+
+def test_incomplete_documents_are_excluded_from_dense_retrieval(mixed_corpus):
+    client, cache = mixed_corpus
+    unfiltered = {p.payload["document_id"] for p in client.query_points("documents", query=hash_embed([QUERY])[0], limit=20).points}
+    assert unfiltered == {"complete", "truncated", "rewritten", "legacy"}  # all of them would match
+    assert docs_of(Retriever(client, hash_embed, cache, FakeReranker()).dense_search(QUERY)) == {"complete"}
+
+
+def test_incomplete_documents_are_excluded_from_bm25(mixed_corpus):
+    client, cache = mixed_corpus
+    assert {p["document_id"] for p, _ in build_bm25(iter_payloads(client)).search(QUERY, 20)} == {
+        "complete", "truncated", "rewritten", "legacy"}  # the unfiltered index would return all of them
+    assert docs_of(Retriever(client, hash_embed, cache, FakeReranker()).bm25_search(QUERY)) == {"complete"}
+
+
+def test_interrupted_rewrite_with_the_same_chunk_count_is_excluded(mixed_corpus):
+    client, cache = mixed_corpus
+    counts = {doc: sum(p["document_id"] == doc for p in iter_payloads(client)) for doc in ("complete", "rewritten")}
+    assert counts == {"complete": 3, "rewritten": 3}  # a count check alone would pass it
+    retriever = Retriever(client, hash_embed, cache, FakeReranker())
+    assert "rewritten" not in docs_of(retriever.dense_search(QUERY)) | docs_of(retriever.bm25_search(QUERY))
+
+
+def test_exclusion_survives_a_restart(mixed_corpus):
+    client, cache = mixed_corpus
+    Retriever(client, hash_embed, cache, FakeReranker())  # the first process
+    restarted = Retriever(client, hash_embed, cache, FakeReranker())  # nothing carried over but Qdrant itself
+    assert docs_of(restarted.dense_search(QUERY)) == docs_of(restarted.bm25_search(QUERY)) == {"complete"}
+
+
+def test_document_becomes_retrievable_once_its_write_completes(mixed_corpus):
+    client, cache = mixed_corpus
+    retriever = Retriever(client, hash_embed, cache, FakeReranker())
+    assert "truncated" not in docs_of(retriever.dense_search(QUERY))
+
+    load(client, cache, make_chunks(policy_texts("truncated"), "truncated"), "truncated")  # re-ingested in full
+    retriever.refresh_bm25()
+    assert "truncated" in docs_of(retriever.dense_search(QUERY)) and "truncated" in docs_of(retriever.bm25_search(QUERY))
+
+
+def test_complete_documents_rank_exactly_as_without_the_filter(env):
+    client, cache = env
+    load(client, cache, make_chunks([f"travel allowance rule number {i} for trip {i}" for i in range(30)]))
+    retriever = Retriever(client, hash_embed, cache, FakeReranker())
+    query = "travel allowance rule"
+
+    unfiltered = client.query_points("documents", query=hash_embed([query])[0], limit=20, with_payload=True).points
+    dense = retriever.dense_search(query)
+    assert [h.chunk_id for h in dense] == [p.payload["chunk_id"] for p in unfiltered]
+    assert [h.dense_score for h in dense] == pytest.approx([p.score for p in unfiltered])
+
+    before = build_bm25(iter_payloads(client)).search(query, 20)
+    assert [(h.chunk_id, h.bm25_score) for h in retriever.bm25_search(query)] == [(p["chunk_id"], s) for p, s in before]
 
 
 def test_query_embeddings_use_the_cache(env):
