@@ -81,8 +81,9 @@ Other decisions:
 ## Project structure
 
 ```text
-app.py              Streamlit UI
-api.py              HTTP API for a UI (FastAPI adapter, single-workspace prototype)
+ui.py               team UI: Streamlit client of the HTTP API (the intended production UI)
+api.py              HTTP API (FastAPI adapter, single shared workspace)
+app.py              V1 Streamlit app: private per-browser session, calls rag/ directly (reference)
 rag/
   config.py         models, constants, settings from env
   extract.py        PDF -> typed page blocks
@@ -109,10 +110,28 @@ uv sync
 docker run -d --name rag-qdrant -p 127.0.0.1:6333:6333 \
   -v rag_qdrant_storage:/qdrant/storage qdrant/qdrant:latest
 cp .env.example .env          # fill in the API keys
-uv run streamlit run app.py   # http://127.0.0.1:8501
+
+# the team UI: start the API, then the UI (two terminals)
+uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
+uv run streamlit run ui.py    # http://127.0.0.1:8501
+
+# or the V1 reference app on its own
+uv run streamlit run app.py
 ```
 
-Qdrant must be running before the app starts.
+Qdrant must be running before the API or the V1 app starts.
+
+## Team UI
+
+`ui.py` is the production interface for a shared team workspace. It is a pure client of the HTTP API: it never imports `rag/`, and it reaches the API from the Streamlit server at `RAG_API_URL` (default `http://127.0.0.1:8000`), so the API itself is never exposed to browsers.
+
+- **Workspace sidebar:** add PDFs, then follow each one through Queued → Processing (reading the PDF, reading figures and scans, indexing…) → Ready. Failed, Incomplete (re-upload the same PDF to repair it) and No text found are explained in plain language. Delete asks for confirmation.
+- **Progress** refreshes every 2 seconds, only while an upload is queued or processing.
+- **Chat:** questions are enabled once a document is Ready. Every answer shows its validated `[document, Page N]` citations with the source passages. "Not enough information" is shown as a neutral note, not an error. Each question is a separate request: earlier questions are not used as context.
+- **Safety:** source passages are shown as plain text and answers with Markdown escaped, so nothing inside a document can render links, images or HTML. No model internals, reasoning or retrieval scores are shown.
+- **Errors:** friendly messages for a full queue, oversized or non-PDF files, duplicates, an unavailable index or answer service, and an unreachable API (with the command to start it).
+
+The workspace is shared and there is no authentication: everyone who can open the UI sees, and can delete, every document. `app.py` stays available as the V1 reference app with private per-browser sessions.
 
 | Variable | Required | Purpose |
 |---|---|---|
@@ -159,12 +178,14 @@ uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1   # docs at http
 ## Deployment
 
 ```text
-Internet -> Nginx (HTTPS, Let's Encrypt) -> Streamlit 127.0.0.1:8501 -> Qdrant 127.0.0.1:6333
-                                                    |
-                                                    +-> MiniMax, Gemini, Jina APIs
+Internet -> Nginx (HTTPS, Let's Encrypt, access control)
+              -> Streamlit ui.py 127.0.0.1:8501
+                   -> API (uvicorn api:app, 1 worker) 127.0.0.1:8000   [never exposed by Nginx]
+                        -> Qdrant 127.0.0.1:6333
+                        -> MiniMax, Gemini, Jina APIs
 ```
 
-Runs on an OCI VM with Docker and systemd. Streamlit and Qdrant both bind to localhost; only Nginx is public. The app has no authentication, so access control belongs at the proxy.
+Runs on an OCI VM with Docker and systemd: one unit for the API (`uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1`) and one for the UI (`uv run streamlit run ui.py`), the UI ordered after the API. Everything binds to localhost; only Nginx is public, and it proxies to Streamlit only (with the WebSocket upgrade headers Streamlit needs, and `client_max_body_size 200M;` for uploads). There is no `/api` location: the UI calls the API server-side. Nothing has authentication, so access control belongs at the proxy. To keep serving the V1 app as well, run it as a separate unit on another port.
 
 ## Evaluation
 

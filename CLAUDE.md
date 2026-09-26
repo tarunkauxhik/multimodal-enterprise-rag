@@ -29,7 +29,8 @@ All of these live as constants in `rag/config.py`.
 
 ## Rules
 
-- V1 stack: Python 3.12, Streamlit, Qdrant, plus `api.py`: a thin FastAPI adapter for a UI that holds no RAG logic (it calls `rag.session` and `rag.store`). No Next.js, LangChain, LangGraph, Redis, Celery, Kubernetes, or extra framework layers.
+- V1 stack: Python 3.12, Streamlit, Qdrant, plus `api.py`: a thin FastAPI adapter that holds no RAG logic (it calls `rag.session` and `rag.store`). No Next.js, LangChain, LangGraph, Redis, Celery, Kubernetes, or extra framework layers.
+- `ui.py` (the team UI) talks to the API only, never to `rag.*` (a test enforces it). Keep it a presentation layer: no retrieval, prompts or citation logic. `app.py` is the V1 reference app and stays unchanged.
 - Add a dependency only in the step that needs it; prefer stdlib or already-installed packages.
 - API keys come only from environment variables (`rag.config.load_settings`). Never hardcode, print, or log them.
 - Never commit PDFs, databases, caches, model files, BM25 index files, or `.env`. Runtime data lives under `data/` (gitignored).
@@ -44,8 +45,9 @@ uv sync                                   # create .venv from pyproject/uv.lock
 uv run pytest                             # tests (offline; in-memory Qdrant, fake embedder)
 uv run python -m rag.ingest file.pdf ...  # extract -> chunk -> embed -> Qdrant (idempotent)
 uv run python -m rag.retrieve "question"  # hybrid retrieval, prints top 5 with citations
-uv run streamlit run app.py               # demo app (run from repo root; binds 127.0.0.1:8501)
-uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1  # HTTP API prototype (single worker only)
+uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1  # HTTP API (single worker only)
+uv run streamlit run ui.py                # team UI over the API (start the API first; RAG_API_URL overrides the address)
+uv run streamlit run app.py               # V1 reference app (run from repo root; binds 127.0.0.1:8501)
 RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s  # real Gemini/Jina/Qdrant, multilingual
 ```
 
@@ -57,11 +59,13 @@ Local Qdrant: Docker container `rag-qdrant` on 127.0.0.1:6333, volume `rag_qdran
 - Overrides via environment: `STREAMLIT_SERVER_ADDRESS`, `STREAMLIT_SERVER_PORT`, `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` (MB, default 200). Oversized files are rejected with a clear message.
 - Keep Qdrant bound to localhost as well (`-p 127.0.0.1:6333:6333`).
 - Single app process assumed. API clients are shared across Streamlit session threads on the assumption they are thread-safe (normal usage for httpx, google-genai, qdrant-client); load-test during deployment.
+- Production shape: Nginx → Streamlit `ui.py` (127.0.0.1:8501) → API (127.0.0.1:8000) → Qdrant. Two systemd units (API, then UI). Nginx proxies only to Streamlit; never add an `/api` location, since `ui.py` calls the API server-side.
 - The HTTP API (`api.py`) has no authentication and one shared workspace: bind it to `127.0.0.1` and put it behind the same proxy access control. Run exactly one Uvicorn worker (`--workers 1`): upload jobs live in memory. The proxy must cap request bodies (nginx `client_max_body_size 200M;`), since Starlette receives an upload in full before the API's own size check.
 
 ## Data flow notes
 
 - Two separate collection models: the CLI (`rag.ingest`, `rag.retrieve`) uses the shared `documents` collection; the Streamlit app uses one private collection per browser session and never reads `documents`. CLI-ingested documents do not appear in the app. The HTTP API (`api.py`) uses one shared workspace, `API_COLLECTION` (default `documents`), so CLI-ingested documents do appear there; it lists documents from Qdrant payloads (`rag.store.list_documents`, no chunk text) and runs ingestion on a single background thread (`ThreadPoolExecutor(max_workers=1)`), keeping each job's live `IngestReport` in memory.
+- Team UI (`ui.py`): polls `GET /api/documents` every 2 s through `st.fragment(run_every=...)` only while a document is queued or processing; the fragment forces one full rerun when polling should start or stop, or when loading fails. Uploads are deduplicated by the SHA-256 of accepted files in session state (hashes only, never bytes), and the uploader is cleared after each batch. Chat history lives in session state for display; each question is one `POST /api/chat`. Source passages render through `st.text`, answers and file names through `ui.plain` (Markdown escaped). `ui.py` runs itself through `import ui` so the app and the tests share one set of classes.
 - App sessions (`rag.session`): each browser session ingests into and retrieves from its own collection `session_<created>_<uuid>` (name held only in server-side session state). Last activity is stored in the collection's Qdrant metadata and refreshed by uploads, questions and app use (at most once a minute); collections inactive for 24h are deleted when a new session starts. A browser refresh starts a new, empty Streamlit session; the abandoned collection is removed by that inactivity cleanup. No accounts or persistence beyond this.
 - Within a session, duplicate file names get a " (2)" suffix so `[document, Page N]` citations stay unambiguous.
 - Multimodal understanding (`rag.understand`): after fast extraction, only pages flagged `scanned` (little text + large image), `garbled` (U+FFFD in text), `legacy_font` (at least half the page's Latin letters in a known pre-Unicode Hindi font such as Arjun or Kruti Dev, read from the PDF's text spans into `Page.legacy_font_share`), `legacy_text` (fallback when no listed font matches: Latin text with few vowels and punctuation inside words), `figure` (large figure whose caption is not an event-photo caption such as "Glimpses…", "Hon'ble…", "…held at…") or `table` (mostly empty cells) are rendered at 150 DPI and sent to MiniMax-M3. M3 output is stored as extracted document content (never an answer): scanned pages become `figure` blocks (tables stay `table`), figures get their visual content, garbled and legacy pages are re-transcribed as `text`. Any failure keeps the fast extraction. Successful results are cached in `data/cache/understanding.sqlite` (bump `PROMPT_VERSION` to invalidate).
