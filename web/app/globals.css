@@ -204,7 +204,8 @@
     @apply my-4;
   }
   .data-table table {
-    @apply w-full border-collapse text-[13px] leading-snug tabular-nums;
+    /* natural width (never narrower than the container): wide tables scroll, narrow ones fill */
+    @apply w-max min-w-full border-collapse text-[13px] leading-snug tabular-nums;
   }
   .data-table :where(th, td) {
     @apply border-b px-3 py-2 text-left align-top whitespace-pre-line;
@@ -222,7 +223,15 @@
     @apply bg-muted/30;
   }
   .data-table [data-numeric] {
-    @apply text-right;
+    @apply text-right whitespace-nowrap;
+  }
+  /* Readable column widths: a wide table scrolls inside its container instead of crushing columns. */
+  .data-table :where(th, td) {
+    min-width: 9ch;
+  }
+  .data-table :where(td:not([data-numeric])) {
+    min-width: 16ch;
+    max-width: 40ch;
   }
   .answer .citation-line {
     @apply -mt-1;

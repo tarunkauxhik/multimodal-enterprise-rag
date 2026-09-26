@@ -43,7 +43,7 @@ export function describe(doc: DocumentSummary): string {
   if (doc.status === "queued") return "Waiting to process"
   if (doc.status === "ready" || doc.status === "incomplete") {
     const pages = doc.pages_with_chunks
-    return `${pages} ${pages === 1 ? "page" : "pages"} · ${doc.chunks} ${doc.chunks === 1 ? "passage" : "passages"}`
+    return `${pages} indexed ${pages === 1 ? "page" : "pages"} · ${doc.chunks} ${doc.chunks === 1 ? "passage" : "passages"}`
   }
   return STATUS[doc.status].label
 }

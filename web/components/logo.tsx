@@ -1,13 +1,17 @@
 import { cn } from "@/lib/utils"
 
-/** The mark: a cited point in square brackets, "[•]" (grounded answers with citations).
- * Inverts with the theme; the point keeps the brand blue. Same drawing as app/icon.svg. */
+const PETAL = "M12 10.4V1.8a8.6 8.6 0 0 1 8.6 8.6Z"
+
+/** The mark: an aperture of four quarter-discs turning around an open centre, focusing on the one
+ * passage that answers the question. Same drawing as app/icon.svg; one colour in both themes. */
 export function LogoMark({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 32 32" aria-hidden className={cn("size-6 shrink-0", className)}>
-      <rect width="32" height="32" rx="8" className="fill-foreground" />
-      <path d="M13 9.5H9.5v13H13M19 9.5h3.5v13H19" fill="none" strokeWidth="3" className="stroke-background" />
-      <circle cx="16" cy="16" r="2.75" fill="#3d7bff" />
+    <svg viewBox="0 0 24 24" aria-hidden className={cn("size-5 shrink-0", className)}>
+      <g fill="#2f6bff">
+        {[0, 90, 180, 270].map((angle) => (
+          <path key={angle} d={PETAL} transform={`rotate(${angle} 12 12)`} />
+        ))}
+      </g>
     </svg>
   )
 }

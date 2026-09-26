@@ -9,8 +9,6 @@ import { useDocuments } from "@/hooks/use-documents"
 type Workspace = ReturnType<typeof useDocuments> & {
   chat: ReturnType<typeof useConversations>
   openFilePicker: () => void
-  commandOpen: boolean
-  setCommandOpen: (open: boolean) => void
 }
 
 const WorkspaceContext = createContext<Workspace | null>(null)
@@ -26,7 +24,6 @@ export function useWorkspace(): Workspace {
 export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const documents = useDocuments()
   const chat = useConversations()
-  const [commandOpen, setCommandOpen] = useState(false)
   const [dragging, setDragging] = useState(false)
   const input = useRef<HTMLInputElement>(null)
   const openFilePicker = useCallback(() => input.current?.click(), [])
@@ -35,7 +32,7 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const hasFiles = (event: React.DragEvent) => event.dataTransfer.types.includes("Files")
 
   return (
-    <WorkspaceContext.Provider value={{ ...documents, chat, openFilePicker, commandOpen, setCommandOpen }}>
+    <WorkspaceContext.Provider value={{ ...documents, chat, openFilePicker }}>
       <div
         className="contents"
         onDragOver={(event) => {

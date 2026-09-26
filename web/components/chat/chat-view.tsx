@@ -11,8 +11,11 @@ import { PageHeader } from "@/components/page-header"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { useWorkspace } from "@/components/workspace-provider"
+import type { Message } from "@/hooks/use-conversations"
 import { errorMessage } from "@/lib/api"
 import { isActive } from "@/lib/status"
+import { replyKind } from "@/lib/types"
+import { cn } from "@/lib/utils"
 
 // Starter questions built from real document names: nothing is invented about their content.
 const STARTERS = [
@@ -60,19 +63,22 @@ export function ChatView() {
               <Fragment key={message.id}>
                 {message.role === "user" ? (
                   <>
-                    {i > 0 && <Separator className="my-8" />}
+                    {i > 0 && <Separator className={isSmallTalk(messages[i + 1]) ? "my-6" : "my-8"} />}
                     <h2
                       ref={(node) => {
                         if (i === 0) firstQuestion.current = node
                         if (i === lastUserIndex) lastQuestion.current = node
                       }}
-                      className="mb-4 scroll-mt-16 text-lg font-semibold tracking-tight whitespace-pre-wrap break-words"
+                      className={cn(
+                        "mb-4 scroll-mt-16 whitespace-pre-wrap wrap-break-word",
+                        isSmallTalk(messages[i + 1]) ? "mb-2 text-[15px] font-medium text-muted-foreground" : "text-lg font-semibold tracking-tight",
+                      )}
                     >
                       <EmojiText text={message.text} />
                     </h2>
                   </>
                 ) : (
-                  <AssistantMessage message={message} onRetry={() => chat.retry(message.id, message.question)} />
+                  <AssistantMessage message={message} onRetry={() => chat.retry(message.id, message.question)} onAsk={chat.ask} />
                 )}
               </Fragment>
             ))}
@@ -161,4 +167,9 @@ function Centered({ emoji, title, text, children }: { emoji: string; title: stri
       {children && <div className="mt-6 flex w-full justify-center">{children}</div>}
     </div>
   )
+}
+
+/** Small talk ("hi", "thanks") is shown as a light exchange, not as a document-style question heading. */
+function isSmallTalk(reply: Message | undefined): boolean {
+  return reply?.role === "assistant" && reply.state === "done" && replyKind(reply.response) === "conversation"
 }

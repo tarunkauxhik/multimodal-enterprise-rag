@@ -115,9 +115,13 @@ class Source(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    abstained: bool
+    abstained: bool  # True for "abstain" and "out_of_scope": the question was not answered
     citations: list[Citation]
     sources: list[Source]  # the chunks behind the citations; Answer.raw_output is never exposed
+    # answer: grounded, cited. abstain: not enough evidence. out_of_scope: not about the documents.
+    # conversation: small talk (no retrieval). workspace: from document metadata. clarify: a question back.
+    kind: session.ReplyKind
+    suggestions: list[str]  # follow-up questions to offer as one-tap replies (clarify/workspace)
 
 
 # --- background ingestion -------------------------------------------------------------
@@ -307,17 +311,19 @@ def create_app(
     @app.post("/api/chat", response_model=ChatResponse)
     def chat(request: ChatRequest) -> ChatResponse:
         try:
-            answer, _ = session.answer_question(services(), state["collection"], request.question)
+            reply = session.respond(services(), state["collection"], request.question)
         except ApiException as exc:  # Qdrant: connection failures and error responses
             raise HTTPException(503, f"Vector database unavailable: {redacted(exc)}") from exc
         except Exception as exc:  # embedding, reranking or answer model
             raise HTTPException(502, f"Could not answer the question: {redacted(exc)}") from exc
-        ids = {(s["source_name"], int(s["page_number"])): s["document_id"] for s in answer.sources}
+        ids = {(s["source_name"], int(s["page_number"])): s["document_id"] for s in reply.sources}
         return ChatResponse(
-            answer=answer.text,
-            abstained=answer.abstained,
-            citations=[Citation(document=doc, document_id=ids[(doc, page)], page=page) for doc, page in answer.citations],
-            sources=[Source(**{field: s[field] for field in Source.model_fields}) for s in answer.sources],
+            answer=reply.text,
+            abstained=reply.kind in ("abstain", "out_of_scope"),
+            citations=[Citation(document=doc, document_id=ids[(doc, page)], page=page) for doc, page in reply.citations],
+            sources=[Source(**{field: s[field] for field in Source.model_fields}) for s in reply.sources],
+            kind=reply.kind,
+            suggestions=reply.suggestions,
         )
 
     return app

@@ -18,27 +18,63 @@ const ROUTES: Record<string, RegExp> = {
 }
 
 const SAFE_DETAIL = new Set([404, 409, 413, 415, 429]) // fixed strings in api.py, no internals
+const KINDS = new Set(["answer", "abstain", "out_of_scope", "conversation", "workspace", "clarify"])
 
-/* eslint-disable @typescript-eslint/no-explicit-any -- upstream JSON, reduced field by field */
-const pick = (o: any, keys: string[]) => Object.fromEntries(keys.filter((k) => o?.[k] !== undefined).map((k) => [k, o[k]]))
+const DOCUMENT_STATUS = new Set(["ready", "incomplete", "queued", "processing", "failed", "empty"])
+const CONTENT_TYPES = new Set(["text", "table", "figure"])
 
-const PROJECT: Record<string, (body: any) => unknown> = {
-  "GET health": (b) => pick(b, ["status"]),
+// Runtime validation: TypeScript types say nothing about what the upstream actually sends. Every
+// value is type-checked; anything unexpected becomes a safe default or its entry is dropped.
+type Json = Record<string, unknown>
+const obj = (v: unknown): Json => (v && typeof v === "object" && !Array.isArray(v) ? (v as Json) : {})
+const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
+const str = (v: unknown, max = 200_000): string => (typeof v === "string" ? v.slice(0, max) : "")
+const count = (v: unknown): number => (Number.isInteger(v) && (v as number) >= 0 ? (v as number) : 0)
+const page = (v: unknown): number | null => (Number.isInteger(v) && (v as number) >= 1 ? (v as number) : null)
+const oneOf = (v: unknown, allowed: Set<string>, fallback: string): string => (typeof v === "string" && allowed.has(v) ? v : fallback)
+
+const PROJECT: Record<string, (body: unknown) => unknown> = {
+  "GET health": (b) => ({ status: obj(b).status === "ok" ? "ok" : "unavailable" }),
   "GET documents": (b) => ({
-    documents: (b.documents ?? []).map((d: any) => ({
-      ...pick(d, ["document_id", "source_name", "status", "chunks", "pages_with_chunks"]),
-      ingestion: d.ingestion ? pick(d.ingestion, ["stage", "pages", "chunks"]) : null,
-    })),
+    documents: list(obj(b).documents)
+      .map(obj)
+      .filter((d) => typeof d.document_id === "string" && /^[0-9a-f]{16}$/.test(d.document_id) && str(d.source_name))
+      .map((d) => ({
+        document_id: d.document_id, // the DELETE key; never displayed
+        source_name: str(d.source_name, 500),
+        status: oneOf(d.status, DOCUMENT_STATUS, "failed"),
+        chunks: count(d.chunks),
+        pages_with_chunks: count(d.pages_with_chunks),
+        ingestion: d.ingestion ? { stage: str(obj(d.ingestion).stage, 40), pages: count(obj(d.ingestion).pages), chunks: count(obj(d.ingestion).chunks) } : null,
+      })),
   }),
-  "POST documents": (b) => pick(b, ["source_name", "status"]),
-  "POST chat": (b) => ({
-    ...pick(b, ["answer", "abstained"]),
-    citations: (b.citations ?? []).map((c: any) => pick(c, ["document", "page"])),
-    sources: (b.sources ?? []).map((s: any) => pick(s, ["source_name", "page_number", "section_path", "content_type", "text"])),
-  }),
+  "POST documents": (b) => ({ source_name: str(obj(b).source_name, 500), status: oneOf(obj(b).status, new Set(["queued", "ready"]), "queued") }),
+  "POST chat": (b) => {
+    const body = obj(b)
+    const abstained = body.abstained === true
+    return {
+      answer: str(body.answer),
+      abstained,
+      kind: oneOf(body.kind, KINDS, abstained ? "abstain" : "answer"),
+      suggestions: list(body.suggestions).filter((s): s is string => typeof s === "string" && s.length > 0 && s.length <= 200).slice(0, 3),
+      citations: list(body.citations)
+        .map(obj)
+        .map((c) => ({ document: str(c.document, 500), page: page(c.page) }))
+        .filter((c) => c.document && c.page !== null),
+      sources: list(body.sources)
+        .map(obj)
+        .map((s) => ({
+          source_name: str(s.source_name, 500),
+          page_number: page(s.page_number),
+          section_path: list(s.section_path).filter((x): x is string => typeof x === "string").slice(0, 12).map((x) => x.slice(0, 300)),
+          content_type: oneOf(s.content_type, CONTENT_TYPES, "text"),
+          text: str(s.text),
+        }))
+        .filter((s) => s.source_name && s.page_number !== null),
+    }
+  },
   "DELETE documents": () => ({ deleted: true }),
 }
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
 const json = (body: unknown, status: number, headers: Record<string, string> = {}) =>
   Response.json(body, { status, headers: { "cache-control": "no-store", ...headers } })

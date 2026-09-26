@@ -9,7 +9,7 @@ afterEach(() => {
   sessionStorage.clear()
 })
 
-// Browser APIs jsdom lacks, used by Radix, cmdk and the sidebar.
+// Browser APIs jsdom lacks, used by Radix and the sidebar.
 window.matchMedia ??= ((query: string) => ({
   matches: false,
   media: query,

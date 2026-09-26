@@ -1,30 +1,75 @@
 import { EmojiText } from "@/components/emoji"
-import { parsePassage } from "@/lib/passage"
+import { FIGURE_CAPTION, inline, parsePassage } from "@/lib/passage"
 import { numericColumns } from "@/lib/tables"
 
-/** A source passage: prose as plain text, pipe tables as real tables. All content is React text. */
-export function Passage({ text }: { text: string }) {
+/** Cleaned text with real super/subscripts. Every part is React text: nothing is parsed as HTML. */
+function Rich({ text }: { text: string }) {
   return (
-    <div className="space-y-3">
-      {parsePassage(text).map((block, i) => {
-        if (block.type === "text") {
+    <>
+      {inline(text).map((part, i) =>
+        part.style === "sup" ? (
+          <sup key={i}>
+            <EmojiText text={part.text} />
+          </sup>
+        ) : part.style === "sub" ? (
+          <sub key={i}>
+            <EmojiText text={part.text} />
+          </sub>
+        ) : (
+          <EmojiText key={i} text={part.text} />
+        ),
+      )}
+    </>
+  )
+}
+
+/** A source passage, rendered by kind: prose as clean text with headings, pipe tables as real
+ * tables, and a figure's leading caption as its title. */
+export function Passage({ text, contentType = "text" }: { text: string; contentType?: string }) {
+  const blocks = parsePassage(text)
+  return (
+    <div className="space-y-2.5">
+      {blocks.map((block, i) => {
+        if (block.type === "heading") {
           return (
-            <p key={i} className="text-[13px] leading-relaxed whitespace-pre-wrap break-words text-foreground/90">
-              <EmojiText text={block.text} />
+            <p key={i} className="text-[13px] font-medium text-foreground">
+              <Rich text={block.text} />
+            </p>
+          )
+        }
+        if (block.type === "text") {
+          const [first, ...rest] = block.text.split("\n")
+          if (contentType === "figure" && i === 0 && FIGURE_CAPTION.test(first)) {
+            return (
+              <div key={i}>
+                <p className="text-[13px] font-medium text-foreground">
+                  <Rich text={first} />
+                </p>
+                {rest.length > 0 && (
+                  <p className="mt-1 text-[13px] leading-relaxed whitespace-pre-wrap wrap-break-word text-foreground/85">
+                    <Rich text={rest.join("\n")} />
+                  </p>
+                )}
+              </div>
+            )
+          }
+          return (
+            <p key={i} className="text-[13px] leading-relaxed whitespace-pre-wrap wrap-break-word text-foreground/85">
+              <Rich text={block.text} />
             </p>
           )
         }
         const numeric = numericColumns(block.rows)
         const num = (j: number) => (numeric[j] ? "" : undefined)
         return (
-          <div key={i} className="data-table overflow-x-auto rounded-md border">
+          <div key={i} className="data-table max-w-full overflow-x-auto rounded-md border">
             <table>
               {block.header && (
                 <thead>
                   <tr>
                     {block.header.map((cell, j) => (
                       <th key={j} scope="col" data-numeric={num(j)}>
-                        <EmojiText text={cell} />
+                        <Rich text={cell} />
                       </th>
                     ))}
                   </tr>
@@ -35,7 +80,7 @@ export function Passage({ text }: { text: string }) {
                   <tr key={r}>
                     {row.map((cell, j) => (
                       <td key={j} data-numeric={num(j)}>
-                        <EmojiText text={cell} />
+                        <Rich text={cell} />
                       </td>
                     ))}
                   </tr>

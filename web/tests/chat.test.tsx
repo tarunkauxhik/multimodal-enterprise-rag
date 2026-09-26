@@ -55,7 +55,8 @@ it("answers with numbered citations and grouped, plain-text sources", async () =
   await user.click(screen.getAllByRole("button", { name: "Source 1: Annual Report.pdf, page 4" })[0])
   const details = await screen.findByRole("dialog")
   expect(within(details).getByText("Revenue grew.")).toBeInTheDocument()
-  expect(within(details).getByText(/Table · Financials/)).toBeInTheDocument()
+  expect(within(details).getByText("Page 4 · Table · Text")).toBeInTheDocument() // page and content kinds in the header
+  expect(within(details).getAllByText("Financials")).toHaveLength(1) // the shared section is shown once
 
   const results = await axe.run(document.body, { rules: { "color-contrast": { enabled: false } } })
   expect(results.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.html.slice(0, 120)).join(" | ")}`)).toEqual([])

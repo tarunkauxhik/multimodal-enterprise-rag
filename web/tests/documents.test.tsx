@@ -33,7 +33,7 @@ it("labels every document status with text, not color alone", async () => {
     "Index incomplete",
     "The document was only partially indexed. Upload the same file again to repair it.",
     "No readable content",
-    "12 pages · 42 passages",
+    "12 indexed pages · 42 passages",
   ]) {
     expect(within(list).getAllByText(text).length, text).toBeGreaterThan(0)
   }
@@ -48,7 +48,7 @@ it("polls only while a document is processing", async () => {
   await screen.findAllByText("Building index")
   api.documents.mockResolvedValue([doc()])
   await act(() => vi.advanceTimersByTimeAsync(2100))
-  await screen.findAllByText("12 pages · 42 passages")
+  await screen.findAllByText("12 indexed pages · 42 passages")
   const calls = api.documents.mock.calls.length
   await act(() => vi.advanceTimersByTimeAsync(10_000))
   expect(api.documents.mock.calls.length).toBe(calls) // nothing active: no more polling

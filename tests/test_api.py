@@ -12,6 +12,7 @@ from rag import store as store_module
 from rag.chunk import Chunk
 from rag.config import EMBED_DIM
 from rag.generate import ABSTAIN_MESSAGE
+from rag.session import EMPTY_WORKSPACE
 from rag.store import delete_document, ensure_collection, list_documents, point_id, replace_document
 from tests.conftest import RecordingModel, build_text_pdf, hash_embed
 
@@ -222,8 +223,9 @@ def test_chat_returns_answer_with_validated_citations_and_sources(api, sample_pd
     response = api.post("/api/chat", json={"question": "What was revenue in 2025?"})
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"answer", "abstained", "citations", "sources"}  # no ranks, scores or raw output
+    assert set(body) == {"answer", "abstained", "citations", "sources", "kind", "suggestions"}  # no ranks, scores or raw output
     assert body["answer"] == REPLY and body["abstained"] is False
+    assert body["kind"] == "answer" and body["suggestions"] == []
     assert body["citations"] == [{"document": "sample.pdf", "document_id": doc_id, "page": 1}]
     assert body["sources"] and all(s["source_name"] == "sample.pdf" and s["page_number"] == 1 for s in body["sources"])
     assert set(body["sources"][0]) == {"chunk_id", "document_id", "source_name", "page_number", "section_path", "content_type", "text"}
@@ -232,7 +234,9 @@ def test_chat_returns_answer_with_validated_citations_and_sources(api, sample_pd
 def test_chat_abstains_on_an_empty_workspace_without_calling_the_model(api):
     response = api.post("/api/chat", json={"question": "What was revenue in 2025?"})
     assert response.status_code == 200
-    assert response.json() == {"answer": ABSTAIN_MESSAGE, "abstained": True, "citations": [], "sources": []}
+    assert response.json() == {
+        "answer": EMPTY_WORKSPACE, "abstained": True, "citations": [], "sources": [], "kind": "abstain", "suggestions": []
+    }
     assert api.services.answer_model.calls == []
 
 

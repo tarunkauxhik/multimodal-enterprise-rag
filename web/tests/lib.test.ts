@@ -88,7 +88,7 @@ group("document status", () => {
   })
 
   it("summarises stored documents", () => {
-    expect(describe(doc({ pages_with_chunks: 1, chunks: 1 }))).toBe("1 page · 1 passage")
+    expect(describe(doc({ pages_with_chunks: 1, chunks: 1 }))).toBe("1 indexed page · 1 passage")
     expect(describe(doc({ status: "failed" }))).toBe("Processing failed")
   })
 })
@@ -123,7 +123,8 @@ group("passages", () => {
   })
 
   it("previews tables as readable text", () => {
-    expect(passagePreview("|Year|Revenue|\n|---|---|\n|2025|120|")).toBe("Year · Revenue · 2025 · 120")
+    expect(passagePreview("|Year|Revenue|\n|---|---|\n|2025|120|")).toBe("Table: Year, Revenue · 1 row")
+    expect(passagePreview("Revenue by year\n|a|b|\n|c|d|")).toBe("Revenue by year Table · 2 rows")
     expect(passagePreview("x".repeat(300), 20)).toHaveLength(20)
   })
 })

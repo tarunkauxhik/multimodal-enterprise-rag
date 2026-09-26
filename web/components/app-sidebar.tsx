@@ -1,6 +1,6 @@
 "use client"
 
-import { FileText, Monitor, Moon, MoreHorizontal, Plus, Search, SquarePen, Sun, Trash2, TriangleAlert } from "lucide-react"
+import { FileText, Monitor, Moon, MoreHorizontal, Plus, SquarePen, Sun, Trash2, TriangleAlert } from "lucide-react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { useTheme } from "next-themes"
@@ -18,7 +18,6 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Kbd } from "@/components/ui/kbd"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   Sidebar,
@@ -36,16 +35,14 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { useModKey } from "@/hooks/use-mod-key"
 import { errorMessage } from "@/lib/api"
 import { describe } from "@/lib/status"
 
 export function AppSidebar() {
-  const { documents, uploads, error, chat, openFilePicker, setCommandOpen } = useWorkspace()
+  const { documents, uploads, error, chat, openFilePicker } = useWorkspace()
   const { setOpenMobile } = useSidebar()
   const pathname = usePathname()
   const router = useRouter()
-  const mod = useModKey()
 
   const goToChat = (conversationId: string | null) => {
     if (conversationId) chat.select(conversationId)
@@ -66,13 +63,6 @@ export function AppSidebar() {
             <SidebarMenuButton tooltip="New chat" onClick={() => goToChat(null)} className="pointer-coarse:h-10">
               <SquarePen />
               <span>New chat</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-          <SidebarMenuItem>
-            <SidebarMenuButton tooltip="Search and commands" onClick={() => setCommandOpen(true)} className="pointer-coarse:h-10">
-              <Search />
-              <span>Search</span>
-              <Kbd className="ml-auto group-data-[collapsible=icon]:hidden">{mod} K</Kbd>
             </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem>

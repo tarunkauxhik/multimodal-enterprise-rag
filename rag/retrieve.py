@@ -93,6 +93,7 @@ class Retriever:
         ensure_collection(client, collection)
         self.bm25: Bm25Index = build_bm25([])
         self.complete_writes: set[str] = set()
+        self.payloads: list[dict] = []
         self.refresh_bm25()
 
     def refresh_bm25(self) -> None:
@@ -104,7 +105,9 @@ class Retriever:
         """
         payloads = list(iter_payloads(self.client, self.collection))
         self.complete_writes = complete_write_ids(payloads)
-        self.bm25 = build_bm25(p for p in payloads if p.get("write_id") in self.complete_writes)
+        # The retrievable chunks, also used for page, overview and metadata answers (rag.session.respond).
+        self.payloads = [p for p in payloads if p.get("write_id") in self.complete_writes]
+        self.bm25 = build_bm25(self.payloads)
 
     def dense_search(self, query: str, top_k: int = DENSE_TOP_K) -> list[Hit]:
         (vector,), _ = embed_texts([query], EMBED_TASK_QUERY, self.embed_query, self.cache)

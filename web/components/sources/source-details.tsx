@@ -1,70 +1,90 @@
 "use client"
 
-import { FileText } from "lucide-react"
-
+import { EmojiText } from "@/components/emoji"
+import { Passage } from "@/components/sources/passage"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet"
 import { useIsMobile } from "@/hooks/use-mobile"
-import { Emoji, EmojiText } from "@/components/emoji"
-import { Passage } from "@/components/sources/passage"
-import { CONTENT_EMOJI, CONTENT_TYPE, type SourceGroup } from "@/lib/citations"
+import { CONTENT_TYPE, type SourceGroup } from "@/lib/citations"
+import { cleanText, plain } from "@/lib/passage"
+
+const typeLabel = (type: string) => CONTENT_TYPE[type] ?? "Text"
+
+/** "Page 2 · Table": the page and the kinds of content cited from it. */
+function meta(group: SourceGroup): string {
+  const types = [...new Set(group.passages.map((p) => typeLabel(p.content_type)))]
+  return [`Page ${group.page}`, ...types].join(" · ")
+}
+
+/** A passage's section heading, only when it adds something: not the document's own title and
+ * not the same as the previous passage's. */
+function sectionLabels(group: SourceGroup): (string | null)[] {
+  const stem = group.document.replace(/\.pdf$/i, "").toLowerCase()
+  let previous = ""
+  return group.passages.map((p) => {
+    const section = plain(cleanText(p.section_path.at(-1) ?? "")).trim()
+    const useful = section !== "" && section.toLowerCase() !== stem && section !== previous
+    previous = section
+    return useful ? section : null
+  })
+}
 
 /** Provenance for one cited document page. Every document-derived string is rendered as React
- * text, never as HTML or Markdown. */
+ * text (components/sources/passage.tsx), never as HTML or Markdown. */
 function SourceBody({ group }: { group: SourceGroup }) {
+  const labels = sectionLabels(group)
+  if (group.passages.length === 0) return <p className="text-sm text-muted-foreground">The passage for this citation isn&apos;t available.</p>
   return (
     <div className="space-y-4">
-      {group.passages.length === 0 && <p className="text-sm text-muted-foreground">The passage for this citation isn&apos;t available.</p>}
       {group.passages.map((passage, i) => (
         <div key={i}>
           {i > 0 && <Separator className="mb-4" />}
-          <p className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Emoji char={CONTENT_EMOJI[passage.content_type] ?? CONTENT_EMOJI.text} decorative />
-            <span>
-              {CONTENT_TYPE[passage.content_type] ?? "Text"}
-              {passage.section_path.length > 0 && (
-                <>
-                  {" · "}
-                  <EmojiText text={passage.section_path.join(" › ")} />
-                </>
-              )}
-            </span>
-          </p>
-          <Passage text={passage.text} />
+          {labels[i] && (
+            <p className="mb-1.5 text-xs font-medium text-muted-foreground">
+              <EmojiText text={labels[i]!} />
+            </p>
+          )}
+          <Passage text={passage.text} contentType={passage.content_type} />
         </div>
       ))}
     </div>
   )
 }
 
-function Title({ group }: { group: SourceGroup }) {
+function Header({ group }: { group: SourceGroup }) {
   return (
-    <span className="flex min-w-0 items-center gap-2">
-      <FileText className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-      <span className="truncate">
-        <EmojiText text={group.document} />
+    <span className="flex min-w-0 items-start gap-2.5 text-left">
+      <span className="mt-px grid size-5 shrink-0 place-items-center rounded border text-[11px] font-medium text-muted-foreground tabular-nums">
+        {group.n}
       </span>
-      <span className="shrink-0 font-normal text-muted-foreground">Page {group.page}</span>
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-medium text-foreground">
+          <EmojiText text={group.document} />
+        </span>
+        <span className="block text-xs font-normal text-muted-foreground">{meta(group)}</span>
+      </span>
     </span>
   )
 }
 
-/** Wraps a trigger (a citation marker or a source row): a popover on desktop, a bottom sheet on mobile. */
+/** Wraps a trigger (a citation marker or a source row): a popover on desktop, a bottom sheet on
+ * touch-sized screens. */
 export function SourceDetails({ group, children }: { group: SourceGroup; children: React.ReactNode }) {
   const mobile = useIsMobile()
+  const label = `Source ${group.n}: ${group.document}, ${meta(group)}`
   if (mobile) {
     return (
       <Sheet>
         <SheetTrigger asChild>{children}</SheetTrigger>
-        <SheetContent side="bottom" className="max-h-[80svh] gap-0">
-          <SheetHeader className="border-b">
-            <SheetTitle className="text-sm">
-              <Title group={group} />
+        <SheetContent side="bottom" className="max-h-[85svh] gap-0">
+          <SheetHeader className="border-b pr-12">
+            <SheetTitle>
+              <Header group={group} />
             </SheetTitle>
-            <SheetDescription className="sr-only">Source {group.n}</SheetDescription>
+            <SheetDescription className="sr-only">{label}</SheetDescription>
           </SheetHeader>
-          <div className="overflow-y-auto p-4">
+          <div className="overflow-y-auto overscroll-contain p-4">
             <SourceBody group={group} />
           </div>
         </SheetContent>
@@ -74,11 +94,11 @@ export function SourceDetails({ group, children }: { group: SourceGroup; childre
   return (
     <Popover>
       <PopoverTrigger asChild>{children}</PopoverTrigger>
-      <PopoverContent align="start" className="w-[32rem] max-w-[calc(100vw-2rem)] gap-0 p-0" aria-label={`Source ${group.n}: ${group.document}, page ${group.page}`}>
-        <div className="border-b px-4 py-2.5 text-sm font-medium">
-          <Title group={group} />
+      <PopoverContent align="start" className="w-136 max-w-[calc(100vw-2rem)] gap-0 p-0" aria-label={label}>
+        <div className="border-b px-4 py-3">
+          <Header group={group} />
         </div>
-        <div className="max-h-96 overflow-y-auto px-4 py-3">
+        <div className="max-h-104 overflow-y-auto overscroll-contain px-4 py-3">
           <SourceBody group={group} />
         </div>
       </PopoverContent>

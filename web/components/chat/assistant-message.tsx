@@ -12,11 +12,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { Message } from "@/hooks/use-conversations"
 import { numberCitations, type SourceGroup } from "@/lib/citations"
 import { passagePreview } from "@/lib/passage"
-import type { ChatResponse } from "@/lib/types"
+import { replyKind, type ChatResponse } from "@/lib/types"
 
 type AssistantMessage = Extract<Message, { role: "assistant" }>
 
-export function AssistantMessage({ message, onRetry }: { message: AssistantMessage; onRetry: () => void }) {
+export function AssistantMessage({ message, onRetry, onAsk }: { message: AssistantMessage; onRetry: () => void; onAsk: (question: string) => void }) {
   if (message.state === "pending") return <Pending />
   if (message.state === "error") {
     return (
@@ -32,29 +32,80 @@ export function AssistantMessage({ message, onRetry }: { message: AssistantMessa
       </div>
     )
   }
-  if (message.response.abstained) {
-    return (
-      <div className="flex gap-3 text-[15px] leading-7">
-        <Emoji char="🤔" decorative className="mt-1" />
-        <div>
-          <p className="text-foreground/80">
-            <EmojiText text={message.response.answer} />
-          </p>
-          <p className="text-sm text-muted-foreground">Try rephrasing, or add a document that covers this topic.</p>
+  const { response } = message
+  switch (replyKind(response)) {
+    case "answer":
+      return <Answer response={response} />
+    case "abstain":
+      return (
+        <div className="flex gap-3 text-[15px] leading-7">
+          <Emoji char="🤔" decorative className="mt-1" />
+          <div>
+            <p className="text-foreground/85">
+              <EmojiText text={response.answer} />
+            </p>
+            <p className="text-sm text-muted-foreground">Try rephrasing, or add a document that covers this topic.</p>
+          </div>
         </div>
+      )
+    case "out_of_scope":
+    case "conversation":
+      return (
+        <p className="text-[15px] leading-7 text-foreground/90">
+          <EmojiText text={response.answer} />
+        </p>
+      )
+    default: // workspace and clarify: short Markdown (document names in bold, lists) plus follow-ups
+      return (
+        <div>
+          <AnswerMarkdown markdown={response.answer} renderCitation={() => null} />
+          <Suggestions questions={response.suggestions ?? []} onAsk={onAsk} />
+        </div>
+      )
+  }
+}
+
+/** One-tap follow-up questions offered with a clarification or a workspace answer. */
+function Suggestions({ questions, onAsk }: { questions: string[]; onAsk: (question: string) => void }) {
+  if (questions.length === 0) return null
+  return (
+    <div role="group" aria-label="Suggested follow-ups" className="mt-3 flex flex-wrap gap-2">
+      {questions.map((question) => (
+        <button
+          key={question}
+          type="button"
+          onClick={() => onAsk(question)}
+          className="max-w-full truncate rounded-md border px-2.5 py-1.5 text-left text-sm text-foreground/90 transition-colors pointer-coarse:py-2.5 hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+        >
+          <EmojiText text={question} />
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** Honest progress: the API answers in one request, so only elapsed time is shown, not fake stages.
+ * Quick replies (greetings, clarifications) arrive before the search message would appear. */
+function Pending() {
+  const [seconds, setSeconds] = useState(0)
+  const [searching, setSearching] = useState(false)
+  useEffect(() => {
+    const show = window.setTimeout(() => setSearching(true), 700)
+    const timer = window.setInterval(() => setSeconds((s) => s + 1), 1000)
+    return () => {
+      window.clearTimeout(show)
+      window.clearInterval(timer)
+    }
+  }, [])
+  if (!searching) {
+    return (
+      <div aria-busy="true" aria-label="Thinking" className="flex h-7 items-center gap-1">
+        {[0, 150, 300].map((delay) => (
+          <span key={delay} className="size-1.5 animate-pulse rounded-full bg-muted-foreground/60" style={{ animationDelay: `${delay}ms` }} />
+        ))}
       </div>
     )
   }
-  return <Answer response={message.response} />
-}
-
-/** Honest progress: the API answers in one request, so only elapsed time is shown, not fake stages. */
-function Pending() {
-  const [seconds, setSeconds] = useState(0)
-  useEffect(() => {
-    const timer = window.setInterval(() => setSeconds((s) => s + 1), 1000)
-    return () => window.clearInterval(timer)
-  }, [])
   return (
     <div aria-live="polite" aria-busy="true" className="space-y-2.5 py-1">
       <p className="flex items-center gap-2 text-sm text-muted-foreground">

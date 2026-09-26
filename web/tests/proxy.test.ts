@@ -111,10 +111,19 @@ it("reduces replies to the fields the UI uses", async () => {
   }))
   const chat = await (await POST(new Request("http://ui/api/chat", { method: "POST", body: "{}" }), context("chat"))).json()
   expect(chat).toEqual({
-    answer: "Revenue was 120 [a.pdf, Page 1].", abstained: false,
+    answer: "Revenue was 120 [a.pdf, Page 1].", abstained: false, kind: "answer", suggestions: [],
     citations: [{ document: "a.pdf", page: 1 }],
     sources: [{ source_name: "a.pdf", page_number: 1, section_path: ["Financials"], content_type: "table", text: "|2025|120|" }],
   })
+
+  // kind must be a known value and suggestions short strings (at most 3), whatever the upstream sends
+  fetch.mockResolvedValueOnce(Response.json({
+    answer: "Do you mean CI?", abstained: false, kind: "<img>", citations: [], sources: [],
+    suggestions: ["What is Compound Interest?", 42, "x".repeat(500), "b", "c", "d"],
+  }))
+  const clarify = await (await POST(new Request("http://ui/api/chat", { method: "POST", body: "{}" }), context("chat"))).json()
+  expect(clarify.kind).toBe("answer")
+  expect(clarify.suggestions).toEqual(["What is Compound Interest?", "b", "c"])
 
   fetch.mockResolvedValueOnce(Response.json({ documents: [{
     document_id: "0123456789abcdef", source_name: "a.pdf", status: "failed", chunks: 0, pages_with_chunks: 0, content_types: { text: 3 },
@@ -139,4 +148,33 @@ it("reduces replies to the fields the UI uses", async () => {
   const invalid = await POST(new Request("http://ui/api/chat", { method: "POST", body: "{}" }), context("chat"))
   expect(invalid.status).toBe(422)
   expect(await invalid.json()).toEqual({ detail: "Request failed." })
+})
+
+it("validates every chat value at runtime, whatever the upstream sends", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(Response.json({
+    answer: { html: "<script>" }, abstained: "yes", kind: ["answer"], suggestions: "What?", debug: "stack trace",
+    citations: "not a list",
+    sources: [
+      { chunk_id: "x-p1-0", document_id: "0123456789abcdef", source_name: "a.pdf", page_number: 1, section_path: ["S", 7, null], content_type: "<img>", text: 42, score: 0.9 },
+      { source_name: "b.pdf", page_number: -1, text: "bad page" },
+      "not an object",
+    ],
+  }))
+  const body = await (await POST(new Request("http://ui/api/chat", { method: "POST", body: "{}" }), context("chat"))).json()
+  expect(body).toEqual({
+    answer: "", abstained: false, kind: "answer", suggestions: [], citations: [],
+    sources: [{ source_name: "a.pdf", page_number: 1, section_path: ["S"], content_type: "text", text: "" }],
+  })
+})
+
+it("validates the document list and keeps only well-formed documents", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(Response.json({ documents: [
+    { document_id: "0123456789abcdef", source_name: "a.pdf", status: "hacked", chunks: -4, pages_with_chunks: "2", write_id: "w", ingestion: { stage: "embed", error: "Traceback" } },
+    { document_id: "../etc/passwd", source_name: "b.pdf", status: "ready" },
+    { document_id: "fedcba9876543210", source_name: "", status: "ready" },
+  ] }))
+  const body = await (await GET(new Request("http://ui/api/documents"), context("documents"))).json()
+  expect(body).toEqual({ documents: [
+    { document_id: "0123456789abcdef", source_name: "a.pdf", status: "failed", chunks: 0, pages_with_chunks: 0, ingestion: { stage: "embed", pages: 0, chunks: 0 } },
+  ] })
 })

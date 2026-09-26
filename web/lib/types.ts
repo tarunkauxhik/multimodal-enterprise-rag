@@ -40,9 +40,18 @@ export interface Source {
   text: string
 }
 
+// answer: grounded and cited. abstain: not enough evidence. out_of_scope: not about the documents.
+// conversation: small talk. workspace: from document metadata. clarify: a question back to the user.
+export type ReplyKind = "answer" | "abstain" | "out_of_scope" | "conversation" | "workspace" | "clarify"
+
 export interface ChatResponse {
   answer: string
   abstained: boolean
   citations: Citation[]
   sources: Source[]
+  kind?: ReplyKind // absent in conversations saved before the field existed
+  suggestions?: string[] // one-tap follow-up questions
 }
+
+/** The reply kind, also for replies saved before `kind` existed. */
+export const replyKind = (r: ChatResponse): ReplyKind => r.kind ?? (r.abstained ? "abstain" : "answer")

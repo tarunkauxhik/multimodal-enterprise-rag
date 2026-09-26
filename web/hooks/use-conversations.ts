@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react"
 
 import { api, errorMessage } from "@/lib/api"
-import type { ChatResponse } from "@/lib/types"
+import { replyKind, type ChatResponse } from "@/lib/types"
 
 export type Message =
   | { id: string; role: "user"; text: string }
@@ -19,6 +19,11 @@ export interface Conversation {
 
 const STORAGE_KEY = "rag.conversations" // this browser tab only; the backend keeps no history
 const ACTIVE_KEY = "rag.activeConversation" // reopen the same conversation after a reload
+
+/** A conversation that so far is only small talk ("hi") takes its title from the first real question. */
+function onlySmallTalk(conversation: Conversation): boolean {
+  return conversation.messages.every((m) => m.role === "user" || (m.state === "done" && replyKind(m.response) === "conversation"))
+}
 
 function load(): Conversation[] {
   try {
@@ -90,7 +95,11 @@ export function useConversations() {
       ]
       setConversations((list) =>
         list.some((c) => c.id === conversationId)
-          ? list.map((c) => (c.id === conversationId ? { ...c, messages: [...c.messages, ...turn] } : c))
+          ? list.map((c) =>
+              c.id === conversationId
+                ? { ...c, title: onlySmallTalk(c) ? question.slice(0, 80) : c.title, messages: [...c.messages, ...turn] }
+                : c,
+            )
           : [{ id: conversationId, title: question.slice(0, 80), messages: turn }, ...list],
       )
       setActiveId(conversationId)

@@ -2,7 +2,6 @@ import { render } from "@testing-library/react"
 import { vi } from "vitest"
 
 import { AppSidebar } from "@/components/app-sidebar"
-import { CommandMenu } from "@/components/command-menu"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
@@ -51,7 +50,6 @@ export function renderWorkspace(page: React.ReactNode) {
         <SidebarProvider>
           <AppSidebar />
           <SidebarInset>{page}</SidebarInset>
-          <CommandMenu />
         </SidebarProvider>
       </WorkspaceProvider>
       <Toaster />
