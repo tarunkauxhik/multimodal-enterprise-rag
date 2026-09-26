@@ -12,8 +12,11 @@ from rag.extract import Block, Document, Page, extract_pdf
 from rag.ingest import ingest_pdf
 from rag.store import iter_payloads
 from rag.understand import (
+    LEGACY_MARK_MIN,
+    LEGACY_MIN_LETTERS,
     PagePlan,
     UnderstandingCache,
+    legacy_text_stats,
     merge_page,
     parse_result,
     plan_page,
@@ -149,12 +152,154 @@ def test_sparse_table_is_re_extracted_dense_table_is_not():
     assert plan.tables == (2,) and plan.reasons == ("table",)
 
 
+def test_page_number_boxed_as_a_one_cell_table_is_not_sparse():
+    """MHI p257: PyMuPDF4LLM boxes the page number as a table; it used to route the page as a sparse table."""
+    plan = plan_page(Page(257, [blk("text", PROSE), blk("table", "|117|")]))
+    assert not plan.needed and plan.reasons == ()
+
+
+def test_header_only_table_is_not_sparse():
+    for header_only in ("|Year|Revenue|Profit|\n|---|---|---|", "|Year|Revenue|Profit|"):
+        assert plan_page(Page(1, [blk("text", PROSE), blk("table", header_only)])).reasons == ()
+
+
+def test_single_data_row_is_too_little_to_judge_sparsity():
+    empty_row = "|Year|Revenue|\n|---|---|\n| | |"
+    assert plan_page(Page(1, [blk("table", empty_row)])).reasons == ()
+
+
+def test_genuine_sparse_table_with_two_data_rows_is_still_re_extracted():
+    two_rows_half_empty = "|Year|Revenue|\n|---|---|\n|2024| |\n| |120|"  # exactly SPARSE_TABLE_RATIO empty
+    plan = plan_page(Page(1, [blk("table", two_rows_half_empty)]))
+    assert plan.tables == (0,) and plan.reasons == ("table",)
+
+
 def test_real_garbled_devanagari_extraction_is_detected():
     pdf = pymupdf.open()
     page = pdf.new_page()
     page.insert_htmlbox(pymupdf.Rect(72, 72, 520, 400), "<h2>यात्रा भत्ता नीति</h2><p>कर्मचारियों को व्यावसायिक यात्रा के लिए प्रतिदिन 3000 रुपये का भत्ता मिलता है।</p>")
     doc = extract_pdf(pdf.tobytes(), "hi.pdf")
     assert "garbled" in plan_page(doc.pages[0]).reasons
+
+
+# Real PyMuPDF4LLM output from the evaluation reports (the PDFs themselves are not committed).
+# MHI annual report p10, set in the legacy Arjun font: the page shows Hindi, the text layer is this.
+LEGACY_PROSE = (
+    'izkÑfrd xSl] isVªksfy;e fjQkbujh mRiknksa vkSj bLikr ds mRiknu dh ekfld o`f) ij ut+j j[krk gSA '
+    "vkbZvkbZih esa bu vkB m|ksxksa dk la;qä Hkkj yxHkx 40-27 izfr'kr gSA o\"kZ 2024&25 ds nkSjku] vkbZlhvkbZ "
+    "dh o`f) 4-5 izfr'kr FkhA foÙkh; o\"kZ 2025&26 ¼vizSy&vxLr½ esa] vkbZlhvkbZ us 2-8 izfr'kr ¼vuafre½ dh "
+    "o`f) ntZ dhA dPps rsy m|ksx dks NksM+dj] lHkh m|ksxksa us ldkjkRed mRiknu o`f) dh izo`fÙk fn[kkbZ gSA "
+    'fiNys dqN o"kks± esa vkbZlhvkbZ ds varxZr vkus okys fofHkUUk m|ksxksa dh o`f) njsa uhps nh xbZ gSa%'
+)
+# MHI p124: a Hindi CPSE table, legacy-font names with numbers set in an English font.
+LEGACY_TABLE = (
+    "|**Ø-**<br>**la-**|**lhih,lbZ dk uke**|**2022&23**<br>**¼okLrfod½**|**2023&24**<br>**¼okLrfod½**|\n"
+    "|---|---|---|---|\n"
+    "|1|ch,pbZ,y|686.00|220.33|\n|2|chchts|13.09|27.95|\n|3|vkj ,aM lh|16.99|23.26|\n"
+    "|5|,p,eVh fyfeVsM|14.91|17.47|\n|8|¯gnqLrku lkYV~l fyfeVsM|8.21|13.23|"
+)
+# NITI English p4: acronyms plus words the extraction merged ("CommunityInnovation"), which look
+# like the lower->UPPER switches of legacy text.
+ACRONYM_TABLE = (
+    "|**ABP**|Aspirational Blocks Programme|\n|---|---|\n|**ACIC**|Atal CommunityInnovation Centre|\n"
+    "|**ADB**|Asian Development Bank|\n|**ADP**|Aspirational Districts Programme|\n"
+    "|**AEDP**|AIM Ecosystem Development Program<br>i|\n|**AI**|Artificial Intelligence|\n"
+    "|**AIC**|Atal Incubation Centers|\n"
+    "|**AIC-IISER**|Atal Incubation Centre - Indian Institute of Science Education and<br>Research|\n"
+    "|**AIC-JIT**|Atal Incubation Centre – JyothyInstitute of TechnologyFoundation|\n"
+    "|**AIC-SKU**|Atal Incubation Centre - Sri Krishnadevaraya University|\n"
+    "|**AICTE**|All India Council for Technical Education|\n|**AIIMS**|All India Institute of Medical Sciences|\n"
+    "|**AIM**|Atal Innovation Mission|\n|**AMA**|Authorized Medical Attendants|\n|**AMCHAM**|American Chamber|\n"
+    "|**AMD**|Advanced Micro Devices|\n|**ANIC**|Atal New India Challenge|\n"
+    "|**ANIIT**|Andaman Nicobar Islands Institution for Transformation|"
+)
+# NITI English p162: a table whose cells PyMuPDF4LLM joins with <br>, the English page that scored the
+# highest in-word marker rate before markup stripping.
+BR_TABLE = (
+    "|**Key Initiative/Event**|**Objective**|**Outcome/Impact**|\n|---|---|---|\n"
+    "|Presidential Visit – ACIC<br>IIT ISM Dhanbad (Jul<br>2025)|To showcase tribal and<br>rural innovation.|"
+    "The Hon’ble President of India,<br>Smt Droupadi Murmu, interacted<br>with innovator Mr Hemlal Mahato<br>"
+    "(JSPR Agro Pvt Ltd), recognising his<br>sustainable agri-waste management<br>solutions.|\n"
+    "|Forbes India “We<br>Serve India Award” –<br>Community Innovator<br>Fellow Ashok (Oct 2025)|To highlight "
+    "tech-led<br>rural entrepreneurship.|Awarded as South & West Regional<br>Winner for developing low-cost<br>"
+    "solar-powered farm machinery;<br>plans to establish an R&D centre in<br>Anjalipuram (Telangana).|\n"
+    "|Grassroots Start-up<br>Funding via ‘Startup<br>Singham’ (Apr 2025)|To encourage local and<br>tribal "
+    "entrepreneurship.|TAMS Tribal, Tribal Mart, and Arola<br>Bamboo (AIC RAISE) secured<br>investment on the "
+    "state-level re|"
+)
+
+
+def evaluated(text):
+    """The fingerprint only runs on enough lowercase text: a negative test must clear that bar to mean anything."""
+    letters, _, _ = legacy_text_stats(text)
+    assert letters >= LEGACY_MIN_LETTERS, f"only {letters} lowercase letters: the fingerprint was never evaluated"
+    return text
+
+
+def test_known_legacy_font_page_is_transcribed_as_legacy_font():
+    plan = plan_page(Page(1, [blk("text", LEGACY_PROSE)], legacy_font_share=0.99))
+    assert plan.transcribe and plan.reasons == ("legacy_font",)  # the font decides; the fingerprint is only a fallback
+
+
+def test_legacy_font_share_threshold_is_half_the_latin_letters():
+    english = evaluated(PROSE * 4)
+    assert plan_page(Page(1, [blk("text", english)], legacy_font_share=0.5)).reasons == ("legacy_font",)
+    assert plan_page(Page(1, [blk("text", english)], legacy_font_share=0.49)).reasons == ()
+
+
+def test_legacy_gibberish_without_a_known_font_is_caught_by_the_text_fingerprint():
+    letters, vowels, marked = legacy_text_stats(evaluated(LEGACY_PROSE))
+    assert vowels < 0.32 and marked >= LEGACY_MARK_MIN
+    plan = plan_page(Page(1, [blk("heading", "Hkkjh m|ksx ea=ky;", level=1), blk("text", LEGACY_PROSE)]))
+    assert plan.transcribe and plan.reasons == ("legacy_text",)
+
+
+def test_normal_english_is_not_routed():
+    plan = plan_page(Page(1, [blk("heading", "Leave Policy", level=2), blk("text", evaluated(PROSE * 4))]))
+    assert not plan.needed and plan.reasons == ()
+
+
+def test_english_acronym_table_is_not_routed():
+    plan = plan_page(Page(4, [blk("heading", "ABBREVIATIONS", level=1), blk("table", evaluated(ACRONYM_TABLE))]))
+    assert plan.reasons == ()
+
+
+def test_markdown_br_table_is_not_a_false_positive():
+    _, vowels, marked = legacy_text_stats(evaluated(BR_TABLE))
+    assert marked < LEGACY_MARK_MIN and vowels > 0.32  # <br> and bold markers are stripped before counting
+    assert plan_page(Page(162, [blk("table", BR_TABLE)])).reasons == ()
+
+
+def test_english_page_with_a_little_legacy_text_is_not_routed():
+    """MHI p232/233: English pages with a Hindi heading in Arjun, about 0.17 of their letters."""
+    blocks = [blk("heading", "Hkkjh m|ksx ea=ky;", level=2), blk("text", evaluated(PROSE * 4))]
+    assert plan_page(Page(232, blocks, legacy_font_share=0.17)).reasons == ()
+
+
+def test_legacy_page_with_english_numbers_is_routed_and_its_table_is_transcribed_not_re_extracted():
+    plan = plan_page(Page(124, [blk("text", "lhih,lbZ dk ykHk"), blk("table", LEGACY_TABLE)], legacy_font_share=0.95))
+    assert plan.transcribe and plan.reasons == ("legacy_font",) and plan.tables == ()
+
+
+def test_legacy_page_with_large_figure_is_transcribed_and_figure_still_described():
+    page = Page(1, [blk("text", LEGACY_PROSE), blk("figure", "", BIG), blk("figure", "", LOGO)], legacy_font_share=0.99)
+    plan = plan_page(page)
+    assert plan.transcribe and plan.figures == (1,) and plan.reasons == ("legacy_font", "figure")
+
+
+def test_legacy_page_transcription_replaces_its_text_as_text_blocks():
+    page = Page(10, [blk("heading", "Hkkjh m|ksx", level=2), blk("text", LEGACY_PROSE)], legacy_font_share=0.99)
+    merged = merge_page(page, plan_page(page), {"page_text": "भारी उद्योग\n\nआईसीआई में 4.5 प्रतिशत की वृद्धि हुई।"})
+    assert [(b.kind, b.text) for b in merged.blocks] == [
+        ("text", "भारी उद्योग"),
+        ("text", "आईसीआई में 4.5 प्रतिशत की वृद्धि हुई।"),
+    ]  # "text", not "figure": only scanned pages become figure blocks
+
+
+def test_unicode_hindi_never_trips_the_legacy_fingerprint():
+    hindi = "नीति आयोग का गठन केंद्रीय मंत्रिमंडल के 01 जनवरी 2015 के संकल्प के माध्यम से किया गया। " * 10
+    assert legacy_text_stats(hindi)[0] == 0  # no Latin letters at all
+    assert plan_page(Page(1, [blk("text", hindi)])).reasons == ()
 
 
 def test_sample_pdf_selects_only_the_figure_page(extracted):
@@ -235,7 +380,7 @@ def test_scanned_page_keeps_document_page_and_section_metadata():
 
 
 def test_sparse_table_replaced_keeping_position():
-    table = blk("table", "|Year|Revenue|\n|---|---|\n| | |", (40, 200, 500, 300))
+    table = blk("table", "|Year|Revenue|\n|---|---|\n| | |\n| | |", (40, 200, 500, 300))  # >= 2 data rows to count as sparse
     page = Page(3, [blk("text", PROSE), table])
     merged = merge_page(page, plan_page(page), {"tables": [{"id": 1, "markdown": "|Year|Revenue|\n|---|---|\n|2025|120|"}]})
     assert merged.blocks[1] == Block("table", "|Year|Revenue|\n|---|---|\n|2025|120|", (40, 200, 500, 300))

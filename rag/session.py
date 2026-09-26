@@ -41,7 +41,7 @@ from rag.config import (
 )
 from rag.embed import EmbedBatch, EmbeddingCache, gemini_embedder
 from rag.generate import Answer, Complete, generate_answer, minimax_client
-from rag.ingest import IngestResult, ingest_pdf
+from rag.ingest import IngestReport, IngestResult, ingest_pdf, report_stage
 from rag.rerank import Rerank, jina_reranker
 from rag.retrieve import Hit, Retriever
 from rag.store import ensure_collection
@@ -167,9 +167,16 @@ def ingest_upload(
     data: bytes,
     source_name: str,
     on_stage: Callable[[str], None] | None = None,
+    report: IngestReport | None = None,
 ) -> IngestResult:
-    embed_cache = EmbeddingCache(services.embed_cache_path)
-    understanding_cache = UnderstandingCache(services.understanding_cache_path)
+    # Failures around ingest_pdf are reported as "setup" and "finish", never as extract/done.
+    if report is None:
+        report = IngestReport(source_name)
+    else:
+        report.reset(source_name)
+    with report_stage(report, "setup"):
+        embed_cache = EmbeddingCache(services.embed_cache_path)
+        understanding_cache = UnderstandingCache(services.understanding_cache_path)
     try:
         result = ingest_pdf(
             data,
@@ -181,11 +188,14 @@ def ingest_upload(
             understanding_cache=understanding_cache,
             collection=collection,
             on_stage=on_stage,
+            report=report,
         )
     finally:
         embed_cache.close()
         understanding_cache.close()
-    touch_session(services.client, collection)  # after ingestion, which may take minutes
+    with report_stage(report, "finish"):  # the document is already stored when this runs
+        touch_session(services.client, collection)  # after ingestion, which may take minutes
+    report.stage = "done"
     return result
 
 

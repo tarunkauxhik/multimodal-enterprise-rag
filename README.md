@@ -48,6 +48,7 @@ Sending every page to a vision model is slow: a 9-page M3 batch took about 30 s.
 |---|---|---|
 | Scanned | < 50 non-space characters and an image covering ~40% of the page | `figure` blocks |
 | Garbled | ≥ 1% U+FFFD replacement characters | re-transcribed `text` |
+| Legacy Hindi font | ≥ 50% of the page's Latin letters in a known pre-Unicode Hindi font (Kruti Dev, Arjun, …); fallback: Latin text with < 32% vowels and ≥ 20% words with in-word punctuation (`m\|ksx`) | re-transcribed `text` |
 | Informational figure | large figure whose caption is not an event photo ("Glimpses…", "Hon'ble…", "…held at…") | figure content |
 | Broken table | ≥ 50% of data cells empty | `table` |
 
@@ -149,7 +150,7 @@ Runs on an OCI VM with Docker and systemd. Streamlit and Qdrant both bind to loc
 ## Limitations
 
 - No authentication; session isolation is not access control.
-- Legacy non-Unicode Hindi fonts (e.g. Arjun, BHARTIYA-HINDI_081) extract as Latin gibberish and are not flagged as garbled.
+- Legacy non-Unicode Hindi fonts (e.g. Arjun, BHARTIYA-HINDI_081) extract as Latin gibberish. Pages that are mostly legacy text are re-read by M3; an English page with only a little legacy text (a Hindi heading, say) keeps that text as gibberish.
 - Unicode Hindi extraction drops parts of some conjuncts and doubles some vowel signs, which weakens BM25.
 - Routing thresholds are heuristic: uncaptioned or decorative images can still reach M3, and vector-drawn charts are missed.
 - Refreshing the page starts a new, empty session.

@@ -19,6 +19,7 @@ import streamlit as st
 
 from rag import session
 from rag.extract import document_id_for
+from rag.ingest import IngestReport, format_report
 
 st.set_page_config(page_title="Document Q&A", page_icon="📄", layout="wide")
 
@@ -54,7 +55,7 @@ def init_state(services: session.Services) -> None:
         st.error(f"Cannot reach the vector database. Is Qdrant running? ({error_text(exc, services)})")
         st.stop()
     state.documents = {}  # document_id -> IngestResult
-    state.failed = {}  # document_id -> (file name, error message)
+    state.failed = {}  # document_id -> (file name, error message, partial IngestReport or None)
     state.result = None  # (question, Answer, hits)
     state.last_touch = time.time()
 
@@ -87,19 +88,36 @@ def ingest(services: session.Services, name: str, data: bytes) -> None:
     if document_id in state.documents or document_id in state.failed:
         return  # already processed in this session (Streamlit reruns the script on every interaction)
     if message := session.upload_size_error(len(data), st.get_option("server.maxUploadSize")):
-        state.failed[document_id] = (name, message)
+        state.failed[document_id] = (name, message, None)
         return
     name = session.unique_source_name(name, (r.source_name for r in state.documents.values()))
+    report = IngestReport(name)  # ours, so the partial progress survives a failure
     with st.status(f"Processing {name}…", expanded=True) as status:
         try:
-            result = session.ingest_upload(services, state.collection, data, name, on_stage=status.write)
+            result = session.ingest_upload(services, state.collection, data, name, on_stage=status.write, report=report)
         except Exception as exc:
-            state.failed[document_id] = (name, error_text(exc, services))
+            state.failed[document_id] = (name, error_text(exc, services), report)
             status.update(label=f"Failed: {name}", state="error", expanded=False)
             return
         status.update(label=f"Ready: {name}", state="complete", expanded=False)
     state.documents[document_id] = result
     state.last_touch = time.time()
+
+
+def ingestion_details(report: IngestReport) -> None:
+    with st.expander("Ingestion details"):
+        st.text(format_report(report))  # the CLI's summary: counts and page numbers, no document text
+
+
+def failure_progress(report: IngestReport) -> str:
+    note = f"Stopped during {report.stage}"
+    if report.error:
+        note += f" ({report.error})"
+    if report.stage == "finish":
+        note += "; the document was stored, but recording this session's activity failed"
+    elif report.embedding.new:
+        note += f"; {report.embedding.new} new embeddings were saved and will be reused when you retry"
+    return note + "."
 
 
 def sidebar(services: session.Services) -> None:
@@ -133,9 +151,14 @@ def sidebar(services: session.Services) -> None:
                     f"Visual understanding failed on pages {', '.join(map(str, result.failed_pages))}; "
                     "fast text extraction was used for those pages."
                 )
+            if result.report:
+                ingestion_details(result.report)
 
-        for name, message in state.failed.values():
+        for name, message, report in state.failed.values():
             st.error(f"{name}: {message}")
+            if report is not None:
+                st.caption(failure_progress(report))
+                ingestion_details(report)
         if state.failed and st.button("Retry failed uploads"):
             state.failed = {}
             st.rerun()

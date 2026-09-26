@@ -12,6 +12,8 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from rag import session
+from rag.embed import EmbedStats
+from rag.ingest import IngestReport, format_report
 
 ROOT = Path(__file__).resolve().parent.parent
 APP = str(ROOT / "app.py")
@@ -123,6 +125,64 @@ def test_expired_session_starts_over_with_a_notice(monkeypatch, fake_services, s
     new_collection = at.session_state["collection"]
     assert new_collection != state["collection"] and fake_services.client.collection_exists(new_collection)
     assert at.session_state["documents"] == {}
+
+
+def sidebar_text(at):
+    return [t.value for t in at.sidebar.text]
+
+
+def test_ingested_document_has_ingestion_details(monkeypatch, fake_services, sample_pdf):
+    state = session_with_sample(fake_services, sample_pdf)
+    at = run_app(monkeypatch, fake_services, state)
+    assert not at.exception
+    assert "Ingestion details" in [e.label for e in at.sidebar.expander]
+    (details,) = sidebar_text(at)
+    (result,) = state["documents"].values()
+    assert details == format_report(result.report)  # the very summary the CLI prints
+    assert details.startswith("sample.pdf  id=") and "  embed" in details and "  store" in details
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "2 pages · " in captions  # the concise caption is kept
+
+
+def test_failed_ingestion_shows_stage_and_partial_progress_without_secrets(monkeypatch, fake_services):
+    report = IngestReport(
+        "broken.pdf", document_id="abc123", pages=3, stage="embed", error="RuntimeError",
+        embedding=EmbedStats(texts=10, unique=10, new=5, batches_attempted=2, batches_succeeded=1),
+        seconds={"extract": 0.1, "understand": 0.0, "chunk": 0.0, "embed": 0.2, "total": 0.3},
+    )
+    collection = session.start_session(fake_services.client)
+    message = session.redact("RuntimeError: quota exceeded for sk-test-secret", fake_services.secrets)
+    state = {"collection": collection, "documents": {}, "failed": {"abc123": ("broken.pdf", message, report)}, "result": None}
+
+    at = run_app(monkeypatch, fake_services, state)
+    assert not at.exception
+    (error,) = at.sidebar.error
+    assert error.value.startswith("broken.pdf: RuntimeError")
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "Stopped during embed (RuntimeError); 5 new embeddings were saved and will be reused" in captions
+    (details,) = sidebar_text(at)
+    assert "FAILED at embed (RuntimeError)" in details and "batches 1/2" in details and "  store" not in details
+    shown = " ".join([error.value, captions, details])
+    assert "sk-test-secret" not in shown
+
+
+def test_failure_after_the_write_says_the_document_was_stored(monkeypatch, fake_services):
+    report = IngestReport("late.pdf", document_id="def456", pages=2, stage="finish", error="RuntimeError",
+                          seconds={"extract": 0.1, "understand": 0.0, "chunk": 0.0, "embed": 0.1, "store": 0.1, "total": 0.4})
+    collection = session.start_session(fake_services.client)
+    state = {"collection": collection, "documents": {}, "failed": {"def456": ("late.pdf", "RuntimeError: x", report)}, "result": None}
+    at = run_app(monkeypatch, fake_services, state)
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "Stopped during finish (RuntimeError); the document was stored" in captions
+    assert "FAILED at finish (RuntimeError)" in sidebar_text(at)[0]
+
+
+def test_oversized_upload_failure_has_no_report(monkeypatch, fake_services):
+    collection = session.start_session(fake_services.client)
+    state = {"collection": collection, "documents": {}, "failed": {"x": ("huge.pdf", "File is too large.", None)}, "result": None}
+    at = run_app(monkeypatch, fake_services, state)
+    assert not at.exception and at.sidebar.error[0].value == "huge.pdf: File is too large."
+    assert "Ingestion details" not in [e.label for e in at.sidebar.expander]
 
 
 def test_answer_errors_are_shown_without_secrets(monkeypatch, fake_services, sample_pdf):

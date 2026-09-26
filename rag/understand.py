@@ -2,15 +2,20 @@
 
 The fast PyMuPDF4LLM extraction stays the default. Only pages whose extraction
 is likely incomplete are rendered and sent to M3, for these reasons:
-- scanned: almost no extracted text, and an image covering most of the page
-- garbled: extracted text contains U+FFFD (missing font mappings, common for Devanagari)
-- figure:  a figure large enough to carry content (logos and icons are skipped) whose
-           caption does not read like an event photo ("Glimpses from…", "Hon'ble …")
-- table:   a table whose Markdown is mostly empty cells
+- scanned:     almost no extracted text, and an image covering most of the page
+- garbled:     extracted text contains U+FFFD (missing font mappings, common for Devanagari)
+- legacy_font: most of the page's Latin letters are drawn in a known legacy (pre-Unicode)
+               Hindi font such as Kruti Dev or Arjun, so the text layer is Latin gibberish
+               ("Hkkjh m|ksx" for भारी उद्योग) that contains no U+FFFD
+- legacy_text: no recognised legacy font, but the text has the same fingerprint: few
+               vowels and punctuation inside words ("m|ksx", "ea=ky;")
+- figure:      a figure large enough to carry content (logos and icons are skipped) whose
+               caption does not read like an event photo ("Glimpses from…", "Hon'ble …")
+- table:       a table whose Markdown is mostly empty cells
 
 M3's reply is extracted document content, never an answer. It is merged into new
 Block objects for the same page number: scanned pages become figure blocks (tables
-stay table blocks), garbled pages get their text replaced, figures get their visual
+stay table blocks), garbled and legacy pages get their text replaced, figures get their visual
 content, sparse tables are re-extracted. Any failure keeps the page's original
 extraction. Successful results are cached so re-ingestion is stable and does not
 call M3 again.
@@ -22,6 +27,7 @@ import logging
 import re
 import sqlite3
 from base64 import b64encode
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -40,6 +46,15 @@ SCAN_FIGURE_AREA = 200_000  # pt², about 40% of an A4/Letter page: treated as a
 GARBLED_RATIO = 0.01  # share of U+FFFD in extracted text
 SPARSE_TABLE_RATIO = 0.5  # share of empty cells in data rows
 REPLACEMENT_CHAR = chr(0xFFFD)
+# Legacy Hindi fonts. Measured on the MHI/NITI evaluation reports (658 pages): legacy pages have a
+# font share >= 0.92, vowel ratio <= 0.29 and marker rate >= 0.35 (5th pct); English pages have a
+# font share <= 0.17, vowel ratio >= 0.36 and marker rate <= 0.09 (95th pct).
+LEGACY_FONT_MIN = 0.5  # share of the page's Latin letters drawn in a known legacy Hindi font
+LEGACY_MIN_LETTERS = 200  # lowercase letters needed before the text fingerprint is trusted
+LEGACY_VOWEL_MAX = 0.32  # share of a/e/i/o/u among lowercase letters
+LEGACY_MARK_MIN = 0.20  # share of words with punctuation or a lower->UPPER switch inside them
+_MARKUP = re.compile(r"<[^>]+>|\*\*")  # PyMuPDF4LLM's <br>/<sup> tags and bold markers
+_IN_WORD_MARK = re.compile(r"[a-z][|;=\]\[}{~^`@<>\\][A-Za-z]|[a-z][A-Z]")
 # ponytail: caption keywords as the photo signal; add an image-complexity check if uncaptioned photos cost too much
 PHOTO_CAPTION = re.compile(
     r"\b(glimpses?|hon[’']?ble|inaugurat|launch|releas|meeting|visit|workshop|seminar|conclave|ceremony|"
@@ -78,6 +93,30 @@ class PagePlan:
 class UnderstandReport:
     understood: list[int] = field(default_factory=list)  # page numbers enriched by M3
     failed: list[int] = field(default_factory=list)  # page numbers that kept the fast extraction
+    from_cache: int = 0  # understood pages served by the understanding cache, without an M3 call
+
+
+@dataclass
+class RoutingStats:
+    m3_enabled: bool = False
+    normal_pages: int = 0  # the fast extraction alone
+    routed_pages: int = 0  # unique pages needing M3: one call each, unless cached
+    reasons: dict[str, int] = field(default_factory=dict)  # a page counts once under each of its reasons
+    overlaps: dict[str, int] = field(default_factory=dict)  # reason combinations on multi-reason pages
+    understood: int = 0
+    failed: list[int] = field(default_factory=list)  # page numbers that kept the fast extraction
+    from_cache: int = 0
+
+
+def routing_stats(plans: list[PagePlan], m3_enabled: bool) -> RoutingStats:
+    routed = [plan for plan in plans if plan.needed]
+    return RoutingStats(
+        m3_enabled=m3_enabled,
+        normal_pages=len(plans) - len(routed),
+        routed_pages=len(routed),
+        reasons=dict(Counter(reason for plan in plans for reason in plan.reasons)),
+        overlaps=dict(Counter("+".join(plan.reasons) for plan in routed if len(plan.reasons) > 1)),
+    )
 
 
 def _area(bbox: tuple[int, int, int, int]) -> int:
@@ -88,14 +127,42 @@ def _is_sparse_table(markdown: str) -> bool:
     rows = [line.strip() for line in markdown.splitlines() if line.strip().startswith("|")]
     rows = [row for row in rows if not ("-" in row and set(row) <= set("|-: "))]  # drop separator rows
     data_rows = rows[1:]  # first row is the header
+    if len(data_rows) < 2:
+        return False  # header-only boxes and page numbers PyMuPDF4LLM boxes as tables ("|117|") are not sparse tables
     cells = [cell.strip() for row in data_rows for cell in row.strip("|").split("|")]
-    return not cells or sum(not cell for cell in cells) / len(cells) >= SPARSE_TABLE_RATIO
+    return sum(not cell for cell in cells) / len(cells) >= SPARSE_TABLE_RATIO
 
 
 def _is_event_photo(blocks: list[Block], i: int) -> bool:
     """A figure whose adjacent caption reads like an event photo, e.g. "Glimpses from … held at Pune"."""
     captions = [blocks[j].text for j in (i - 1, i + 1) if 0 <= j < len(blocks) and blocks[j].kind == "caption"]
     return any(PHOTO_CAPTION.search(caption) for caption in captions)
+
+
+def legacy_text_stats(text: str) -> tuple[int, float, float]:
+    """(lowercase letters, vowel ratio, in-word marker rate) over the page's word-like Latin tokens."""
+    lines = []
+    for line in _MARKUP.sub(" ", text).splitlines():
+        # Markdown table pipes are cell borders; in-word "|" glyphs of legacy prose are kept elsewhere.
+        lines.append(line.replace("|", " ") if line.lstrip().startswith("|") else line)
+    words = []
+    for token in " ".join(lines).split():
+        if any(ch.isdigit() for ch in token) or "@" in token or "." in token.strip(".,;:"):
+            continue  # numbers, emails, URLs and dotted abbreviations say nothing about the script
+        if sum(ch.isascii() and ch.isalpha() for ch in token) < 2 or token.strip(".,:;()*\"'").isupper():
+            continue  # acronyms are consonant-heavy in any language
+        words.append(token)
+    lower = [ch for word in words for ch in word if ch.isascii() and ch.islower()]
+    if not lower:
+        return 0, 0.0, 0.0
+    vowels = sum(ch in "aeiou" for ch in lower) / len(lower)
+    marked = sum(bool(_IN_WORD_MARK.search(word)) for word in words) / len(words)
+    return len(lower), vowels, marked
+
+
+def _looks_legacy_encoded(text: str) -> bool:
+    letters, vowels, marked = legacy_text_stats(text)
+    return letters >= LEGACY_MIN_LETTERS and vowels < LEGACY_VOWEL_MAX and marked >= LEGACY_MARK_MIN
 
 
 def plan_page(page: Page) -> PagePlan:
@@ -112,6 +179,10 @@ def plan_page(page: Page) -> PagePlan:
         reasons.append("scanned")
     if chars and text.count(REPLACEMENT_CHAR) / chars >= GARBLED_RATIO:
         reasons.append("garbled")
+    if page.legacy_font_share >= LEGACY_FONT_MIN:
+        reasons.append("legacy_font")
+    elif _looks_legacy_encoded("\n".join(b.text for b in page.blocks if b.kind != "figure")):
+        reasons.append("legacy_text")  # fallback for legacy fonts missing from extract.LEGACY_HINDI_FONTS
     transcribe = bool(reasons)
 
     # A page scan is transcribed, not described; other large figures are described unless they are event photos.
@@ -268,6 +339,7 @@ def understand_document(
             key = cache_key(doc.document_id, page.number, plan, dpi)
             try:
                 result = cache.get(key) if cache else None
+                cached = result is not None
                 if result is None:
                     png = pdf[page.number - 1].get_pixmap(dpi=dpi).tobytes("png")
                     result = parse_result(complete(build_messages(page, plan, png, dpi / 72)))
@@ -285,5 +357,6 @@ def understand_document(
                 cache.put(key, result)
             merged[page.number] = new_page
             report.understood.append(page.number)
+            report.from_cache += cached
 
     return Document(doc.document_id, doc.source_name, [merged.get(p.number, p) for p in doc.pages]), report
