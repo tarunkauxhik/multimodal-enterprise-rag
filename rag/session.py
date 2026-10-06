@@ -11,7 +11,7 @@ delete_session): each stores its last activity time in Qdrant collection metadat
 deleted after SESSION_TTL_SECONDS of inactivity. They served the former per-browser
 Streamlit app; the API does not use them.
 
-Threads: the API clients in Services (httpx-based Jina and MiniMax clients, google-genai,
+Threads: the API clients in Services (httpx-based Jina and LLM clients, google-genai,
 qdrant-client) are shared across request and ingestion threads on the assumption that they
 are safe for concurrent requests, which is their normal usage; this is not load-tested yet.
 SQLite caches are not shared: they are opened per operation.
@@ -31,13 +31,14 @@ from rag.config import (
     EMBED_CACHE_PATH,
     EMBED_TASK_DOCUMENT,
     EMBED_TASK_QUERY,
-    GENERATION_THINKING,
+    GENERATION_REASONING_EFFORT,
     UNDERSTAND_CACHE_PATH,
     UNDERSTAND_MAX_TOKENS,
+    UNDERSTAND_REASONING_EFFORT,
     load_settings,
 )
 from rag.embed import EmbedBatch, EmbeddingCache, gemini_embedder
-from rag.generate import Answer, Complete, generate_answer, minimax_client
+from rag.generate import Answer, Complete, generate_answer, llm_client
 from rag.route import NO_WORKSPACE, WHAT_IS_THIS, Route, classify, expand_term, normalize
 from rag.ingest import IngestReport, IngestResult, ingest_pdf, report_stage
 from rag.rerank import Rerank, jina_reranker
@@ -72,9 +73,11 @@ def build_services() -> Services:
         embed_document=gemini_embedder(s.gemini_api_key, EMBED_TASK_DOCUMENT),
         embed_query=gemini_embedder(s.gemini_api_key, EMBED_TASK_QUERY),
         rerank=jina_reranker(s.jina_api_key),
-        answer_model=minimax_client(s.minimax_api_key, s.minimax_base_url, thinking=GENERATION_THINKING),
-        understand_model=minimax_client(s.minimax_api_key, s.minimax_base_url, max_tokens=UNDERSTAND_MAX_TOKENS),
-        secrets=tuple(k for k in (s.minimax_api_key, s.gemini_api_key, s.jina_api_key, s.qdrant_api_key) if k),
+        answer_model=llm_client(s.xai_api_key, s.xai_base_url, reasoning_effort=GENERATION_REASONING_EFFORT),
+        understand_model=llm_client(
+            s.xai_api_key, s.xai_base_url, max_tokens=UNDERSTAND_MAX_TOKENS, reasoning_effort=UNDERSTAND_REASONING_EFFORT
+        ),
+        secrets=tuple(k for k in (s.xai_api_key, s.gemini_api_key, s.jina_api_key, s.qdrant_api_key) if k),
     )
 
 

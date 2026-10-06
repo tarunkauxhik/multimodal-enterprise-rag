@@ -1,7 +1,7 @@
-"""Selective multimodal page understanding with MiniMax-M3.
+"""Selective multimodal page understanding with the vision LLM (xAI Grok 4.7).
 
 The fast PyMuPDF4LLM extraction stays the default. Only pages whose extraction
-is likely incomplete are rendered and sent to M3, for these reasons:
+is likely incomplete are rendered and sent to the model, for these reasons:
 - scanned:     almost no extracted text, and an image covering most of the page
 - garbled:     extracted text contains U+FFFD (missing font mappings, common for Devanagari)
 - legacy_font: most of the page's Latin letters are drawn in a known legacy (pre-Unicode)
@@ -13,12 +13,13 @@ is likely incomplete are rendered and sent to M3, for these reasons:
                caption does not read like an event photo ("Glimpses from…", "Hon'ble …")
 - table:       a table whose Markdown is mostly empty cells
 
-M3's reply is extracted document content, never an answer. It is merged into new
+The model's reply is extracted document content, never an answer. It is merged into new
 Block objects for the same page number: scanned pages become figure blocks (tables
 stay table blocks), garbled and legacy pages get their text replaced, figures get their visual
 content, sparse tables are re-extracted. Any failure keeps the page's original
 extraction. Successful results are cached so re-ingestion is stable and does not
-call M3 again.
+call the model again. The cache key includes the provider and model, so results from
+another model (e.g. the earlier MiniMax-M3) are never reused.
 """
 
 import hashlib
@@ -33,7 +34,7 @@ from pathlib import Path
 
 import pymupdf
 
-from rag.config import MINIMAX_MODEL, UNDERSTAND_DPI
+from rag.config import LLM_MODEL, LLM_PROVIDER, UNDERSTAND_DPI
 from rag.extract import Block, Document, Page
 from rag.generate import Complete, strip_think
 
@@ -91,16 +92,16 @@ class PagePlan:
 
 @dataclass
 class UnderstandReport:
-    understood: list[int] = field(default_factory=list)  # page numbers enriched by M3
+    understood: list[int] = field(default_factory=list)  # page numbers enriched by the model
     failed: list[int] = field(default_factory=list)  # page numbers that kept the fast extraction
-    from_cache: int = 0  # understood pages served by the understanding cache, without an M3 call
+    from_cache: int = 0  # understood pages served by the understanding cache, without a model call
 
 
 @dataclass
 class RoutingStats:
-    m3_enabled: bool = False
+    understanding_enabled: bool = False
     normal_pages: int = 0  # the fast extraction alone
-    routed_pages: int = 0  # unique pages needing M3: one call each, unless cached
+    routed_pages: int = 0  # unique pages needing the model: one call each, unless cached
     reasons: dict[str, int] = field(default_factory=dict)  # a page counts once under each of its reasons
     overlaps: dict[str, int] = field(default_factory=dict)  # reason combinations on multi-reason pages
     understood: int = 0
@@ -108,10 +109,10 @@ class RoutingStats:
     from_cache: int = 0
 
 
-def routing_stats(plans: list[PagePlan], m3_enabled: bool) -> RoutingStats:
+def routing_stats(plans: list[PagePlan], understanding_enabled: bool) -> RoutingStats:
     routed = [plan for plan in plans if plan.needed]
     return RoutingStats(
-        m3_enabled=m3_enabled,
+        understanding_enabled=understanding_enabled,
         normal_pages=len(plans) - len(routed),
         routed_pages=len(routed),
         reasons=dict(Counter(reason for plan in plans for reason in plan.reasons)),
@@ -230,7 +231,7 @@ def build_messages(page: Page, plan: PagePlan, png: bytes, scale: float) -> list
 
 
 def parse_result(content: str) -> dict:
-    """Extract the JSON object from an M3 reply (tolerates <think> and code fences)."""
+    """Extract the JSON object from a model reply (tolerates <think> and code fences)."""
     match = re.search(r"\{.*\}", strip_think(content), re.S)
     if not match:
         raise ValueError("no JSON object in response")
@@ -272,7 +273,7 @@ def _markdown_blocks(markdown: str, prose_kind: str) -> list[Block]:
 
 
 def merge_page(page: Page, plan: PagePlan, result: dict) -> Page | None:
-    """Return a new Page with M3 results merged, or None if nothing usable came back."""
+    """Return a new Page with model results merged, or None if nothing usable came back."""
     descriptions = _by_id(result.get("figures"), "description")
     tables = _by_id(result.get("tables"), "markdown")
     page_text = result.get("page_text")
@@ -296,7 +297,7 @@ def merge_page(page: Page, plan: PagePlan, result: dict) -> Page | None:
 
 
 class UnderstandingCache:
-    """Successful M3 page results as JSON, keyed by cache_key."""
+    """Successful model page results as JSON, keyed by cache_key."""
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,7 +317,7 @@ class UnderstandingCache:
 
 
 def cache_key(document_id: str, page_number: int, plan: PagePlan, dpi: int) -> str:
-    raw = f"{MINIMAX_MODEL}\n{PROMPT_VERSION}\n{dpi}\n{document_id}\n{page_number}\n{plan.transcribe}\n{plan.figures}\n{plan.tables}"
+    raw = f"{LLM_PROVIDER}/{LLM_MODEL}\n{PROMPT_VERSION}\n{dpi}\n{document_id}\n{page_number}\n{plan.transcribe}\n{plan.figures}\n{plan.tables}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -327,7 +328,7 @@ def understand_document(
     cache: UnderstandingCache | None = None,
     dpi: int = UNDERSTAND_DPI,
 ) -> tuple[Document, UnderstandReport]:
-    """Return a new Document with selected pages enriched by M3; the input is not modified."""
+    """Return a new Document with selected pages enriched by the model; the input is not modified."""
     report = UnderstandReport()
     todo = [(page, plan) for page in doc.pages if (plan := plan_page(page)).needed]
     if not todo:

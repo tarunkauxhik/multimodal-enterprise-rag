@@ -1,10 +1,11 @@
-"""Grounded answer generation with MiniMax-M3 over the final reranked chunks.
+"""Grounded answer generation with the LLM (xAI Grok 4.7) over the final reranked chunks.
 
 Defences, in order:
 - Retrieved text goes only into delimited <source> blocks marked as untrusted
   data; source tags inside chunk text are neutralised so a chunk cannot close
   its own block, and the rules are restated after the sources.
-- M3's <think> reasoning is removed from the output.
+- Any <think> reasoning in the reply text is removed. Grok returns its reasoning in a separate field
+  (message.reasoning_content) that is never read, so this is a provider-neutral safeguard.
 - Every [document, Page N] citation is checked against the (document, page)
   pairs actually supplied: unknown ones are removed, and an answer left with no
   valid citation is treated as ungrounded and replaced by an abstention. A bare
@@ -20,12 +21,9 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from rag.config import GENERATION_MAX_TOKENS, MINIMAX_MODEL
+from rag.config import GENERATION_MAX_TOKENS, GENERATION_REASONING_EFFORT, LLM_MODEL
 
-RETRY_STATUS = {408, 429, 500, 502, 503, 504}
-# MiniMax can report failures as HTTP 200 with a non-zero base_resp.status_code.
-# ponytail: assumed retryable codes (1000 unknown, 1001 timeout, 1002 rate limit, 1013 internal); confirm with gateway docs
-RETRY_BASE_CODES = {1000, 1001, 1002, 1013}
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}  # transient: rate limits, timeouts, server errors
 
 ABSTAIN_TOKEN = "INSUFFICIENT_CONTEXT"
 ABSTAIN_MESSAGE = "I couldn’t find enough in the uploaded docs to answer that reliably."
@@ -34,7 +32,7 @@ ABSTAIN_MESSAGE = "I couldn’t find enough in the uploaded docs to answer that 
 SCOPE_TOKEN = "OUT_OF_SCOPE"
 SCOPE_MESSAGE = "That’s outside the uploaded docs, so I’d rather not guess. Ask me anything about what’s in them."
 
-# messages -> assistant content (raw, may include <think>)
+# messages -> assistant content (raw reply text; reasoning is not part of it)
 Complete = Callable[[list[dict]], str]
 
 SYSTEM_PROMPT = f"""You are a document question-answering assistant. Answer strictly from the sources in the user's message.
@@ -172,25 +170,32 @@ def generate_answer(query: str, chunks: Sequence[dict], complete: Complete) -> A
     return Answer(text, abstained=False, citations=citations, sources=sources, removed_citations=removed, raw_output=raw)
 
 
-def minimax_client(
+def llm_client(
     api_key: str,
     base_url: str,
     *,
+    model: str = LLM_MODEL,
     max_tokens: int = GENERATION_MAX_TOKENS,
-    thinking: bool = True,  # False sends thinking={"type": "disabled"} (supported by MiniMax-M3)
+    reasoning_effort: str = GENERATION_REASONING_EFFORT,
     attempts: int = 5,
     timeout: float = 120.0,
     transport: httpx.BaseTransport | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Complete:
+    """A Complete over an OpenAI-compatible Chat Completions endpoint (xAI: POST {base_url}/chat/completions).
+
+    Sends max_completion_tokens (visible output; reasoning tokens are not counted) and
+    reasoning_effort. Returns choices[0].message.content only: a reasoning trace, if any, arrives in
+    message.reasoning_content and is never read. Transient failures (HTTP 408/429/5xx, transport
+    errors, malformed replies) are retried with backoff; other HTTP errors fail at once. Errors never
+    contain the API key.
+    """
     http = httpx.Client(
         base_url=base_url, timeout=timeout, transport=transport, headers={"Authorization": f"Bearer {api_key}"}
     )
 
     def complete(messages: list[dict]) -> str:
-        body = {"model": MINIMAX_MODEL, "messages": messages, "max_tokens": max_tokens}
-        if not thinking:
-            body["thinking"] = {"type": "disabled"}
+        body = {"model": model, "messages": messages, "max_completion_tokens": max_tokens, "reasoning_effort": reasoning_effort}
         error = ""
         for attempt in range(attempts):
             retryable = True
@@ -205,20 +210,17 @@ def minimax_client(
                 if data is None:
                     error = f"HTTP {resp.status_code}: {resp.text[:200]}"
                     retryable = resp.status_code in RETRY_STATUS
-                elif code := (data.get("base_resp") or {}).get("status_code", 0):
-                    error = f"MiniMax error {code}: {data['base_resp'].get('status_msg', '')}"
-                    retryable = code in RETRY_BASE_CODES
-                elif not data.get("choices"):
+                elif not isinstance(data, dict) or not data.get("choices"):
                     error = "no choices in response"
                 else:
                     choice = data["choices"][0]
                     if choice.get("finish_reason") == "length":
-                        raise RuntimeError(f"MiniMax response truncated at max_tokens={max_tokens}")
-                    return choice["message"].get("content") or ""
+                        raise RuntimeError(f"LLM response truncated at max_completion_tokens={max_tokens}")
+                    return (choice.get("message") or {}).get("content") or ""
             if not retryable:
                 break
             if attempt + 1 < attempts:
                 sleep(min(2**attempt, 30) + random.random())
-        raise RuntimeError(f"MiniMax completion failed: {error}".replace(api_key, "***"))
+        raise RuntimeError(f"LLM completion failed: {error}".replace(api_key, "***"))
 
     return complete

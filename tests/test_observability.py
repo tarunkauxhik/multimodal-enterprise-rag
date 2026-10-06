@@ -84,7 +84,7 @@ def test_existing_result_fields_are_unchanged(env, sample_pdf):
 def test_routing_counts_match_plan_page(env, sample_pdf):
     routing = ingest(env, sample_pdf, complete=FakeM3()).report.routing
     plans = [plan_page(p) for p in extract_pdf(sample_pdf, "sample.pdf").pages]
-    assert routing.m3_enabled
+    assert routing.understanding_enabled
     assert routing.routed_pages == sum(p.needed for p in plans) == 1  # page 1 has the chart
     assert routing.normal_pages == 1 and routing.reasons == {"figure": 1} and routing.overlaps == {}
     assert routing.understood == 1 and routing.failed == [] and routing.from_cache == 0
@@ -98,21 +98,21 @@ def test_unique_routed_pages_are_counted_apart_from_reasons_and_overlaps():
         PagePlan(transcribe=True, figures=(3,), reasons=("scanned", "figure")),
         PagePlan(),
     ]
-    stats = routing_stats(plans, m3_enabled=True)
-    assert stats.routed_pages == 4 and stats.normal_pages == 1  # 4 M3 calls, not 6 reason hits
+    stats = routing_stats(plans, understanding_enabled=True)
+    assert stats.routed_pages == 4 and stats.normal_pages == 1  # 4 model calls, not 6 reason hits
     assert stats.reasons == {"legacy_font": 2, "figure": 3, "scanned": 1}
     assert stats.overlaps == {"legacy_font+figure": 1, "scanned+figure": 1}
 
 
 def test_routing_is_reported_when_m3_is_disabled(env, sample_pdf):
     routing = ingest(env, sample_pdf, complete=None).report.routing
-    assert not routing.m3_enabled
-    assert routing.routed_pages == 1 and routing.reasons == {"figure": 1}  # what M3 would have been asked
+    assert not routing.understanding_enabled
+    assert routing.routed_pages == 1 and routing.reasons == {"figure": 1}  # what the model would have been asked
     assert routing.understood == 0 and routing.failed == [] and routing.from_cache == 0
 
 
 def test_m3_failures_are_recorded_as_page_numbers(env, sample_pdf):
-    routing = ingest(env, sample_pdf, complete=RecordingModel(RuntimeError("M3 down"))).report.routing
+    routing = ingest(env, sample_pdf, complete=RecordingModel(RuntimeError("LLM down"))).report.routing
     assert routing.understood == 0 and routing.failed == [1]
 
 
@@ -122,7 +122,7 @@ def test_m3_cache_hits_are_counted(env, sample_pdf):
     second = ingest(env, sample_pdf, complete=model).report.routing
     assert (first.understood, first.from_cache) == (1, 0)
     assert (second.understood, second.from_cache) == (1, 1)
-    assert len(model.calls) == 1  # the second run never called M3
+    assert len(model.calls) == 1  # the second run never called the model
 
 
 # --- chunks and embedding --------------------------------------------------------
@@ -331,7 +331,7 @@ def test_report_round_trips_through_json(env, sample_pdf):
 def known_report(**overrides):
     fields = dict(
         source_name="mhi.pdf", document_id="ba5c6d183cb01260", pages=266, stage="done", empty_pages=[2, 4],
-        routing=RoutingStats(m3_enabled=True, normal_pages=80, routed_pages=186,
+        routing=RoutingStats(understanding_enabled=True, normal_pages=80, routed_pages=186,
                              reasons={"legacy_font": 130, "figure": 106, "scanned": 8, "table": 1},
                              overlaps={"legacy_font+figure": 60, "scanned+figure": 3},
                              understood=184, failed=[12, 47], from_cache=120),
@@ -350,7 +350,7 @@ def test_format_report_is_concise_and_covers_every_stage():
     assert lines[0] == "mhi.pdf  id=ba5c6d183cb01260  266 pages  total 40.8 s"
     assert len(lines) == 6 and [line.split()[0] for line in lines[1:]] == list(STAGES)
     assert "266 pages, 2 empty" in text
-    assert "186 to M3 (scanned 8, legacy_font 130, figure 106, sparse table 1; 63 overlapping), 80 normal" in text
+    assert "186 for understanding (scanned 8, legacy_font 130, figure 106, sparse table 1; 63 overlapping), 80 normal" in text
     assert "understood 184 (120 from cache), failed 2 (pages 12, 47)" in text
     assert "1036 (figure 44, table 180, text 812)" in text
     assert "1036 texts, 1012 unique: 832 new, 180 cached; batches 167/167; transport retries 2" in text
@@ -366,18 +366,18 @@ def test_format_report_shows_the_failed_stage_and_only_stages_that_started():
 
 
 def test_format_report_says_when_m3_was_disabled():
-    report = known_report(routing=RoutingStats(m3_enabled=False, normal_pages=1, routed_pages=1, reasons={"figure": 1}))
-    assert "M3 disabled" in format_report(report) and "understood" not in format_report(report)
+    report = known_report(routing=RoutingStats(understanding_enabled=False, normal_pages=1, routed_pages=1, reasons={"figure": 1}))
+    assert "understanding disabled" in format_report(report) and "understood" not in format_report(report)
 
 
 @pytest.fixture
 def offline_cli(monkeypatch, tmp_path):
-    """rag.ingest.main wired to fakes: in-memory Qdrant, hash embedder, fake M3, caches under tmp_path."""
+    """rag.ingest.main wired to fakes: in-memory Qdrant, hash embedder, fake vision model, caches under tmp_path."""
     monkeypatch.setattr(ingest_module, "load_settings", lambda: SimpleNamespace(
-        qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", minimax_api_key="k", minimax_base_url="u"))
+        qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", xai_api_key="k", xai_base_url="u"))
     monkeypatch.setattr(ingest_module, "QdrantClient", lambda **kw: QdrantClient(":memory:"))
     monkeypatch.setattr(ingest_module, "gemini_embedder", lambda key, task: hash_embed)
-    monkeypatch.setattr(ingest_module, "minimax_client", lambda *a, **kw: FakeM3())
+    monkeypatch.setattr(ingest_module, "llm_client", lambda *a, **kw: FakeM3())
     monkeypatch.setattr(ingest_module, "EMBED_CACHE_PATH", tmp_path / "cache" / "e.sqlite")
     monkeypatch.setattr(ingest_module, "UNDERSTAND_CACHE_PATH", tmp_path / "cache" / "u.sqlite")
     return tmp_path
@@ -432,10 +432,10 @@ def noisy_embedder(texts):
 
 tmp = Path(sys.argv[1])
 ingest.load_settings = lambda: SimpleNamespace(
-    qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", minimax_api_key="k", minimax_base_url="u")
+    qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", xai_api_key="k", xai_base_url="u")
 ingest.QdrantClient = lambda **kw: QdrantClient(":memory:")
 ingest.gemini_embedder = lambda key, task: noisy_embedder
-ingest.minimax_client = lambda *a, **kw: FakeM3()
+ingest.llm_client = lambda *a, **kw: FakeM3()
 ingest.EMBED_CACHE_PATH = tmp / "cache" / "e.sqlite"
 ingest.UNDERSTAND_CACHE_PATH = tmp / "cache" / "u.sqlite"
 pdf = tmp / "sample.pdf"

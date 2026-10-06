@@ -16,14 +16,22 @@ EMBED_CACHE_PATH = DATA_DIR / "cache" / "embeddings.sqlite"
 UNDERSTAND_CACHE_PATH = DATA_DIR / "cache" / "understanding.sqlite"
 
 # --- Benchmarked decisions (see CLAUDE.md before changing) ---
-MINIMAX_MODEL = "MiniMax-M3"
-GENERATION_MAX_TOKENS = 4096  # includes M3 <think> reasoning tokens; not benchmarked
-# Answers run with M3 thinking disabled: with thinking on, M3 intermittently starts the answer before
-# closing </think> (github.com/MiniMax-AI/MiniMax-M3/issues/28), so stripping the reasoning drops the
-# answer's opening words. Verified via our gateway: no <think> output, citations and abstention intact.
-GENERATION_THINKING = False
+# LLM for page understanding and answers: xAI Grok 4.7 over its OpenAI-compatible Chat Completions
+# API (POST {XAI_BASE_URL}/chat/completions). Temporary replacement for MiniMax-M3, whose gateway is
+# unavailable; the pipeline was benchmarked with MiniMax-M3, not with Grok.
+LLM_PROVIDER = "xai"
+LLM_MODEL = "grok-4.7"
+DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
+# Grok 4.7 always reasons ("Reasoning cannot be disabled"; efforts low|medium|high (default)|xhigh,
+# docs.x.ai). Reasoning is returned separately (message.reasoning_content), never inside the answer
+# text. Answers are grounded extraction from five supplied chunks and page understanding is
+# transcription: neither needs deep multi-step reasoning, so both use "low" for latency and cost.
+GENERATION_REASONING_EFFORT = "low"
+UNDERSTAND_REASONING_EFFORT = "low"
+# max_completion_tokens: caps visible output only; reasoning tokens are not counted against it.
+GENERATION_MAX_TOKENS = 4096  # not benchmarked
 UNDERSTAND_MAX_TOKENS = 8192  # page transcription can be long; not benchmarked
-UNDERSTAND_DPI = 150  # page render resolution sent to M3 (~3.2k prompt tokens per page)
+UNDERSTAND_DPI = 150  # page render resolution sent to the vision model (PNG; xAI accepts PNG/JPEG up to 20 MiB)
 
 GEMINI_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768
@@ -42,17 +50,17 @@ DENSE_TOP_K = 20
 BM25_TOP_K = 20
 RRF_K = 60
 RRF_TOP_K = 10  # fused candidates sent to Jina
-RERANK_TOP_K = 5  # chunks sent to MiniMax for the answer
+RERANK_TOP_K = 5  # chunks sent to the LLM for the answer
 
-REQUIRED_SECRETS = ("MINIMAX_API_KEY", "GEMINI_API_KEY", "JINA_API_KEY")
+REQUIRED_SECRETS = ("XAI_API_KEY", "GEMINI_API_KEY", "JINA_API_KEY")
 
 
 @dataclass(frozen=True)
 class Settings:
-    minimax_api_key: str = field(repr=False)
+    xai_api_key: str = field(repr=False)
     gemini_api_key: str = field(repr=False)
     jina_api_key: str = field(repr=False)
-    minimax_base_url: str
+    xai_base_url: str
     qdrant_url: str
     qdrant_api_key: str | None = field(default=None, repr=False)
 
@@ -80,12 +88,10 @@ def load_settings(env_file: Path | None = ROOT / ".env") -> Settings:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
     return Settings(
-        minimax_api_key=os.environ["MINIMAX_API_KEY"].strip(),
+        xai_api_key=os.environ["XAI_API_KEY"].strip(),
         gemini_api_key=os.environ["GEMINI_API_KEY"].strip(),
         jina_api_key=os.environ["JINA_API_KEY"].strip(),
-        minimax_base_url=os.environ.get(
-            "MINIMAX_BASE_URL", "https://llm-gateway-azure.penpencil.guru/v1"
-        ).rstrip("/"),
+        xai_base_url=(os.environ.get("XAI_BASE_URL", "").strip() or DEFAULT_XAI_BASE_URL).rstrip("/"),
         qdrant_url=os.environ.get("QDRANT_URL", "http://127.0.0.1:6333").rstrip("/"),
         qdrant_api_key=os.environ.get("QDRANT_API_KEY", "").strip() or None,
     )

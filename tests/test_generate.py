@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from rag.config import GENERATION_MAX_TOKENS, MINIMAX_MODEL
+from rag.config import DEFAULT_XAI_BASE_URL, GENERATION_MAX_TOKENS, GENERATION_REASONING_EFFORT, LLM_MODEL
 from rag.generate import (
     ABSTAIN_MESSAGE,
     ABSTAIN_TOKEN,
@@ -11,7 +11,7 @@ from rag.generate import (
     SCOPE_TOKEN,
     build_messages,
     generate_answer,
-    minimax_client,
+    llm_client,
     strip_think,
     validate_citations,
 )
@@ -203,8 +203,8 @@ def test_strip_think(raw, expected):
 
 
 def test_stripping_cannot_recover_an_answer_started_inside_think():
-    # MiniMax-AI/MiniMax-M3#28: the answer's opening words land inside <think>. No stripping rule can
-    # tell them from reasoning, which is why answer generation runs with thinking disabled.
+    # Seen with the earlier MiniMax-M3 (MiniMax-AI/MiniMax-M3#28): the answer's opening words land inside
+    # <think>. No stripping rule can tell them from reasoning; Grok returns reasoning in a separate field.
     raw = "<think>\nI should greet them in Spanish.¡Hola! 👋 ¿Cómo\n</think>\n\nestás?"
     assert strip_think(raw) == "estás?"
 
@@ -222,75 +222,119 @@ def test_citations_inside_think_are_ignored():
     assert answer.text == "Leave is 24 days [handbook.pdf, Page 3]." and answer.removed_citations == []
 
 
-# 5. API client -----------------------------------------------------------------
+# 5. API client (xAI Chat Completions) ------------------------------------------
 
-KEY = "mm_secret_key_456"
-BASE = "https://gateway.example/v1"
+KEY = "xai-secret-key-456"
+BASE = DEFAULT_XAI_BASE_URL
 
 
-def ok(content, finish_reason="stop"):
+def ok(content, finish_reason="stop", reasoning=None):
+    message = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        message["reasoning_content"] = reasoning
     return httpx.Response(
         200,
         json={
-            "choices": [{"index": 0, "finish_reason": finish_reason, "message": {"role": "assistant", "content": content}}],
-            "base_resp": {"status_code": 0, "status_msg": ""},
+            "id": "x",
+            "object": "chat.completion",
+            "model": LLM_MODEL,
+            "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "completion_tokens_details": {"reasoning_tokens": 5}},
         },
     )
 
 
-def client(handler, sleeps):
-    return minimax_client(KEY, BASE, transport=httpx.MockTransport(handler), sleep=sleeps.append)
+def client(handler, sleeps, **kwargs):
+    return llm_client(KEY, BASE, transport=httpx.MockTransport(handler), sleep=sleeps.append, **kwargs)
 
 
-def test_client_sends_openai_compatible_request():
+def test_client_sends_xai_chat_completions_request():
     seen = {}
 
     def handler(request):
-        seen["url"], seen["auth"], seen["body"] = str(request.url), request.headers["authorization"], json.loads(request.content)
-        return ok("<think>x</think>Hi")
+        seen["method"], seen["url"] = request.method, str(request.url)
+        seen["auth"], seen["body"] = request.headers["authorization"], json.loads(request.content)
+        return ok("Hi")
 
     messages = [{"role": "user", "content": "hello"}]
-    assert client(handler, [])(messages) == "<think>x</think>Hi"
-    assert seen["url"] == f"{BASE}/chat/completions"
+    assert client(handler, [])(messages) == "Hi"
+    assert seen["method"] == "POST" and seen["url"] == "https://api.x.ai/v1/chat/completions"
     assert seen["auth"] == f"Bearer {KEY}"
-    assert seen["body"] == {"model": MINIMAX_MODEL, "messages": messages, "max_tokens": GENERATION_MAX_TOKENS}
+    assert seen["body"] == {
+        "model": "grok-4.7",
+        "messages": messages,
+        "max_completion_tokens": GENERATION_MAX_TOKENS,
+        "reasoning_effort": GENERATION_REASONING_EFFORT,
+    }
+    assert "thinking" not in seen["body"] and "max_tokens" not in seen["body"]  # MiniMax-only / deprecated
 
 
-def test_client_can_disable_thinking():
+def test_client_passes_model_tokens_and_reasoning_effort():
     seen = {}
 
     def handler(request):
         seen["body"] = json.loads(request.content)
         return ok("Hi")
 
-    minimax_client(KEY, BASE, thinking=False, transport=httpx.MockTransport(handler), sleep=lambda s: None)([])
-    assert seen["body"]["thinking"] == {"type": "disabled"}
+    client(handler, [], model="grok-other", max_tokens=123, reasoning_effort="high")([])
+    assert seen["body"]["model"] == "grok-other"
+    assert seen["body"]["max_completion_tokens"] == 123 and seen["body"]["reasoning_effort"] == "high"
+
+
+def test_client_returns_content_and_never_reasoning_content():
+    reply = client(lambda r: ok("Leave is 24 days.", reasoning="secret chain of thought"), [])([])
+    assert reply == "Leave is 24 days."
+    assert client(lambda r: ok(None), [])([]) == ""  # null content: empty reply, which generation abstains on
+
+
+def test_client_sends_multimodal_messages_unchanged():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return ok("{}")
+
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Page 1"}, image]}]
+    client(handler, [])(messages)
+    assert seen["body"]["messages"] == messages
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_client_retries_transient_http_errors(status):
+    responses, sleeps = iter([httpx.Response(status, json={"error": "busy"}), ok("done")]), []
+    assert client(lambda r: next(responses), sleeps)([]) == "done"
+    assert len(sleeps) == 1
 
 
 @pytest.mark.parametrize(
     "first",
-    [httpx.Response(429, text="slow down"), httpx.Response(200, json={"base_resp": {"status_code": 1002, "status_msg": "rate limit"}})],
-    ids=["http-429", "base_resp-rate-limit"],
+    [httpx.Response(200, text="not json"), httpx.Response(200, json={"choices": []}), httpx.Response(200, json=[1])],
+    ids=["invalid-json", "no-choices", "not-an-object"],
 )
-def test_client_retries_rate_limits(first):
+def test_client_retries_malformed_replies(first):
     responses, sleeps = iter([first, ok("done")]), []
     assert client(lambda r: next(responses), sleeps)([]) == "done"
     assert len(sleeps) == 1
 
 
 @pytest.mark.parametrize(
-    "response, fragment",
+    "response",
     [
-        (httpx.Response(401, text=f"bad key {KEY}"), "HTTP 401"),
-        (httpx.Response(200, json={"base_resp": {"status_code": 1004, "status_msg": f"auth failed for {KEY}"}}), "MiniMax error 1004"),
+        httpx.Response(400, json={"code": "Client specified an invalid argument", "error": "bad model"}),
+        httpx.Response(401, text=f"Incorrect API key provided: {KEY}"),
+        httpx.Response(403, json={"error": f"forbidden for {KEY}"}),
+        httpx.Response(404, json={"error": "model not found"}),
     ],
-    ids=["http-401", "base_resp-auth"],
+    ids=["400", "401", "403", "404"],
 )
-def test_client_does_not_retry_permanent_errors_and_redacts_key(response, fragment):
+def test_client_does_not_retry_permanent_errors_and_redacts_key(response):
     sleeps = []
     with pytest.raises(RuntimeError) as exc:
         client(lambda r: response, sleeps)([])
-    assert fragment in str(exc.value) and KEY not in str(exc.value)
+    message = str(exc.value)
+    assert message.startswith("LLM completion failed: HTTP ") and str(response.status_code) in message
+    assert KEY not in message
     assert sleeps == []
 
 
@@ -308,4 +352,4 @@ def test_client_transport_errors_exhaust_attempts():
 
 def test_client_raises_on_truncated_output():
     with pytest.raises(RuntimeError, match="truncated"):
-        client(lambda r: ok("<think>long...", finish_reason="length"), [])([])
+        client(lambda r: ok("long...", finish_reason="length"), [])([])

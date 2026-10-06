@@ -1,9 +1,9 @@
-"""Ingest PDFs: extract -> selective M3 understanding -> chunk -> embed (cached) -> Qdrant.
+"""Ingest PDFs: extract -> selective LLM page understanding -> chunk -> embed (cached) -> Qdrant.
 
 Usage: uv run python -m rag.ingest path/to/file.pdf [more.pdf ...] [--json]
 
-Idempotent: document and chunk ids are content-derived, embeddings and M3 page
-results are cached, and re-ingesting a document replaces its points in place.
+Idempotent: document and chunk ids are content-derived, embeddings and page
+understanding results are cached, and re-ingesting a document replaces its points in place.
 The BM25 index is rebuilt from Qdrant by the app, so ingestion does not touch it.
 
 The CLI always writes to the shared QDRANT_COLLECTION ("documents"), which is also
@@ -37,11 +37,12 @@ from rag.config import (
     QDRANT_COLLECTION,
     UNDERSTAND_CACHE_PATH,
     UNDERSTAND_MAX_TOKENS,
+    UNDERSTAND_REASONING_EFFORT,
     load_settings,
 )
 from rag.embed import EmbedBatch, EmbeddingCache, EmbedStats, embed_texts, gemini_embedder
 from rag.extract import extract_pdf
-from rag.generate import Complete, minimax_client
+from rag.generate import Complete, llm_client
 from rag.store import document_point_count, ensure_collection, replace_document
 from rag.understand import RoutingStats, UnderstandingCache, plan_page, routing_stats, understand_document
 
@@ -91,8 +92,8 @@ class IngestResult:
     pages: int
     chunks: int
     newly_embedded: int
-    understood_pages: list[int] = field(default_factory=list)  # enriched by M3
-    failed_pages: list[int] = field(default_factory=list)  # M3 failed; fast extraction kept
+    understood_pages: list[int] = field(default_factory=list)  # enriched by the vision model
+    failed_pages: list[int] = field(default_factory=list)  # understanding failed; fast extraction kept
     report: IngestReport | None = None
 
 
@@ -158,10 +159,10 @@ def ingest_pdf(
             report.empty_pages = [p.number for p in doc.pages if not any(b.text.strip() for b in p.blocks)]
 
         with _timed(report, "understand"):
-            # Planned on the fast extraction, so routing is reported even with M3 disabled.
-            report.routing = routing_stats([plan_page(p) for p in doc.pages], m3_enabled=complete is not None)
+            # Planned on the fast extraction, so routing is reported even with understanding disabled.
+            report.routing = routing_stats([plan_page(p) for p in doc.pages], understanding_enabled=complete is not None)
             if complete is not None:
-                stage("Checking for figures, tables and scanned pages (MiniMax M3 where needed)")
+                stage("Checking for figures, tables and scanned pages (vision model where needed)")
                 doc, understanding = understand_document(doc, data, complete, understanding_cache)
                 understood, failed = understanding.understood, understanding.failed
                 report.routing.understood = len(understood)
@@ -219,14 +220,14 @@ def format_report(report: IngestReport) -> str:
             reasons = ", ".join(
                 f"{REASON_LABELS.get(k, k)} {r.reasons[k]}" for k in REASON_ORDER if r.reasons.get(k)
             )
-            detail = f"{r.routed_pages} to M3 ({reasons or 'no reasons'}; {sum(r.overlaps.values())} overlapping), "
+            detail = f"{r.routed_pages} for understanding ({reasons or 'no reasons'}; {sum(r.overlaps.values())} overlapping), "
             detail += f"{r.normal_pages} normal"
-            if r.m3_enabled:
+            if r.understanding_enabled:
                 detail += f"; understood {r.understood} ({r.from_cache} from cache), failed {len(r.failed)}"
                 if r.failed:
                     detail += f" (pages {', '.join(map(str, r.failed))})"
             else:
-                detail += "; M3 disabled"
+                detail += "; understanding disabled"
         elif name == "chunk":
             by_type = ", ".join(f"{k} {v}" for k, v in report.chunks_by_type.items())
             detail = f"{sum(report.chunks_by_type.values())} ({by_type})" if by_type else "0"
@@ -280,7 +281,9 @@ def _ingest_paths(pdfs: list[Path], summary: bool) -> tuple[list[IngestReport], 
     settings = load_settings()
     client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     embed_batch = gemini_embedder(settings.gemini_api_key, EMBED_TASK_DOCUMENT)
-    complete = minimax_client(settings.minimax_api_key, settings.minimax_base_url, max_tokens=UNDERSTAND_MAX_TOKENS)
+    complete = llm_client(
+        settings.xai_api_key, settings.xai_base_url, max_tokens=UNDERSTAND_MAX_TOKENS, reasoning_effort=UNDERSTAND_REASONING_EFFORT
+    )
     cache = EmbeddingCache(EMBED_CACHE_PATH)
     understanding_cache = UnderstandingCache(UNDERSTAND_CACHE_PATH)
 

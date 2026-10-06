@@ -5,7 +5,7 @@ re-ingesting a document never re-embeds it and an interrupted run resumes where
 it stopped. Rate limits (429) and transient server errors are retried by the
 SDK with exponential backoff and jitter; transport-level failures (dropped
 connections, TLS errors) never reach that layer and are retried here, with the
-same backoff the Jina and MiniMax clients use.
+same backoff the Jina and LLM clients use.
 
 embed_texts can fill an EmbedStats with cache hits, new embeddings, batches and
 our transport retries. The SDK's own 429/5xx retries are internal to google-genai

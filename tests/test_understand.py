@@ -1,6 +1,8 @@
 import json
 import re
+from base64 import b64decode
 
+import httpx
 import pymupdf
 import pytest
 from qdrant_client import QdrantClient
@@ -16,12 +18,15 @@ from rag.understand import (
     LEGACY_MIN_LETTERS,
     PagePlan,
     UnderstandingCache,
+    cache_key,
     legacy_text_stats,
     merge_page,
     parse_result,
     plan_page,
     understand_document,
 )
+from rag import understand
+from rag.generate import llm_client
 
 PROSE = "Employees receive 24 days of paid annual leave per calendar year, with carry-forward rules."
 BAD = chr(0xFFFD)  # what PyMuPDF emits for glyphs without a Unicode mapping
@@ -133,7 +138,7 @@ def test_ordinary_text_pages_never_call_m3():
             page.insert_text((72, 80 + i * 18), f"Page {n} line {i}: employees receive paid leave and allowances.", fontsize=11)
     data = pdf.tobytes()
     doc = extract_pdf(data, "text.pdf")
-    m3 = FakeM3(RuntimeError("M3 must not be called for text pages"))
+    m3 = FakeM3(RuntimeError("the model must not be called for text pages"))
     enriched, report = understand_document(doc, data, m3)
     assert m3.calls == [] and report.understood == [] and report.failed == []
     assert enriched is doc
@@ -418,7 +423,7 @@ def test_only_selected_pages_sent_and_merged_with_metadata_intact(extracted, sam
 @pytest.mark.parametrize(
     "reply",
     [
-        RuntimeError("MiniMax completion failed: HTTP 503"),
+        RuntimeError("LLM completion failed: HTTP 503"),
         "I cannot help with that.",
         "[]",
         '{"figures": [{"id": 999, "description": "wrong block"}]}',
@@ -492,3 +497,50 @@ def test_ingest_survives_m3_outage_with_fast_extraction(qdrant, sample_pdf, tmp_
     )
     assert degraded.failed_pages == [1] and degraded.understood_pages == []
     assert degraded.chunks == fast.chunks == qdrant.count(QDRANT_COLLECTION).count
+
+
+# --- xAI provider: image requests and cache separation -----------------------------
+
+
+def test_page_image_reaches_xai_as_png_data_uri(extracted, sample_pdf):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]})
+
+    complete = llm_client("k", "https://api.x.ai/v1", transport=httpx.MockTransport(handler), sleep=lambda s: None)
+    understand_document(extracted, sample_pdf, complete)
+    assert len(bodies) == 1  # only the routed page is sent, not every page
+    body = bodies[0]
+    assert body["model"] == "grok-4.7" and body["reasoning_effort"] in {"low", "medium", "high", "xhigh"}
+    text_part, image_part = body["messages"][1]["content"]
+    assert text_part["type"] == "text" and image_part["type"] == "image_url"
+    url = image_part["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+    png = b64decode(url.removeprefix("data:image/png;base64,"))
+    assert png.startswith(b"\x89PNG\r\n\x1a\n") and len(png) < 20 * 1024 * 1024  # xAI: PNG/JPEG up to 20 MiB
+
+
+def test_cache_key_separates_provider_and_model(monkeypatch):
+    plan = PagePlan(figures=(0,), reasons=("figure",))
+    current = cache_key("doc", 1, plan, 150)
+    monkeypatch.setattr(understand, "LLM_PROVIDER", "minimax")
+    monkeypatch.setattr(understand, "LLM_MODEL", "MiniMax-M3")
+    assert cache_key("doc", 1, plan, 150) != current
+    monkeypatch.setattr(understand, "LLM_PROVIDER", "xai")
+    monkeypatch.setattr(understand, "LLM_MODEL", "grok-other")
+    assert cache_key("doc", 1, plan, 150) != current
+
+
+def test_results_from_another_model_are_not_reused(extracted, sample_pdf, tmp_path, monkeypatch):
+    cache = UnderstandingCache(tmp_path / "u.sqlite")
+    monkeypatch.setattr(understand, "LLM_PROVIDER", "minimax")
+    monkeypatch.setattr(understand, "LLM_MODEL", "MiniMax-M3")
+    understand_document(extracted, sample_pdf, FakeM3(), cache)  # an old MiniMax result in the cache
+    monkeypatch.undo()
+
+    grok = FakeM3()
+    _, report = understand_document(extracted, sample_pdf, grok, cache)
+    assert len(grok.calls) == 1 and report.from_cache == 0
+    cache.close()

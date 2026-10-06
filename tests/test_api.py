@@ -77,7 +77,7 @@ def test_health_checks_qdrant_only(api):
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "qdrant": True, "collection": WORKSPACE}
     assert api.services.answer_model.calls == [] and api.services.understand_model.calls == []
-    assert api.services.embed_document.texts == 0  # no Gemini, MiniMax or Jina call
+    assert api.services.embed_document.texts == 0  # no Gemini, LLM or Jina call
 
 
 def test_health_reports_qdrant_outage_as_503(api, monkeypatch):
@@ -249,7 +249,7 @@ def test_chat_abstains_when_the_answer_has_no_valid_citation(api, sample_pdf):
 
 def test_chat_provider_errors_are_502_and_redacted(api, sample_pdf):
     ingested(api, sample_pdf)
-    api.services.answer_model = RecordingModel(RuntimeError("MiniMax completion failed: HTTP 401 invalid key sk-test-secret"))
+    api.services.answer_model = RecordingModel(RuntimeError("LLM completion failed: HTTP 401 invalid key sk-test-secret"))
     response = api.post("/api/chat", json={"question": "What was revenue in 2025?"})
     assert response.status_code == 502
     assert "HTTP 401" in response.json()["detail"] and "sk-test-secret" not in response.text

@@ -44,4 +44,4 @@ The requested split (8/5/4/4/5/2) adds up to 28. The two extra slots went to X04
 ## Known limitations the set avoids depending on
 
 - The MHI Hindi half (PDF 1-136) uses legacy non-Unicode fonts (Arjun, BHARTIYA-HINDI_081) and extracts as Latin gibberish. The Hindi→English questions therefore point at the English half.
-- The visual questions (V01, H05, G05, S01) can only be answered if ingestion runs selective MiniMax-M3 page understanding.
+- The visual questions (V01, H05, G05, S01) can only be answered if ingestion runs selective vision-model page understanding (Grok 4.7).

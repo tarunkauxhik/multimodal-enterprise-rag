@@ -70,7 +70,7 @@ def hash_embed(texts):
 
 
 class RecordingModel:
-    """Fake MiniMax client: returns `reply` (or raises it) and records every call."""
+    """Fake LLM client: returns `reply` (or raises it) and records every call."""
 
     def __init__(self, reply):
         self.reply, self.calls = reply, []
@@ -95,7 +95,7 @@ def fake_services(tmp_path):
         embed_query=hash_embed,
         rerank=lambda query, docs, top_n: [(i, 1.0 - i / 100) for i in range(len(docs))][:top_n],
         answer_model=RecordingModel("Revenue was 120 in 2025 [sample.pdf, Page 1]."),
-        understand_model=RecordingModel(RuntimeError("M3 offline in tests")),
+        understand_model=RecordingModel(RuntimeError("LLM offline in tests")),
         embed_cache_path=tmp_path / "embeddings.sqlite",
         understanding_cache_path=tmp_path / "understanding.sqlite",
         secrets=("sk-test-secret",),

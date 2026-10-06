@@ -2,7 +2,7 @@
 
 Produces typed blocks in reading order, grouped by page. No network calls:
 OCR is disabled here; scanned pages and figures are left for the selective
-MiniMax understanding step, which fills in figure block text before chunking.
+LLM understanding step, which fills in figure block text before chunking.
 """
 
 import hashlib
@@ -145,7 +145,7 @@ def _blocks(page_chunk: dict) -> list[Block]:
         bbox = tuple(box["bbox"])
 
         if cls in FIGURE_CLASSES:
-            blocks.append(Block("figure", raw, bbox))  # kept even if empty: caption/MiniMax may fill it
+            blocks.append(Block("figure", raw, bbox))  # kept even if empty: caption/understanding may fill it
         elif not raw:
             continue
         elif cls in HEADING_CLASSES:

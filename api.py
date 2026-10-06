@@ -210,7 +210,7 @@ def create_app(
 
     @app.get("/api/health", response_model=HealthResponse)
     def health(response: Response) -> HealthResponse:
-        try:  # Qdrant only: never Gemini, Jina or MiniMax
+        try:  # Qdrant only: never Gemini, Jina or the LLM
             services().client.get_collections()
             ok = True
         except Exception:

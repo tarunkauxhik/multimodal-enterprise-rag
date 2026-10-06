@@ -7,8 +7,8 @@ modality, category and group.
     uv run python -m evals.benchmark [--no-ingest] [--only E01,H01]
 
 This measures retrieval only, over the baseline text-extracted corpus: the
-MiniMax understanding step is off, so it is not an end-to-end RAG evaluation
-and its numbers are a floor for the shipped pipeline, which ingests with M3.
+vision understanding step is off, so it is not an end-to-end RAG evaluation
+and its numbers are a floor for the shipped pipeline, which ingests with it.
 
 Production extraction, chunking, embedding and retrieval are used unchanged.
 The corpus is ingested into its own "eval_retrieval" collection, never the
@@ -83,7 +83,7 @@ PRODUCTION_TOP_K = RERANK_TOP_K  # 5: the chunks production actually sends to th
 CONFIGS = ("dense", "bm25", "rrf", "rrf_rerank")
 METRICS = ("recall@5", "recall@10", "mrr@10", "ndcg@10")
 BREAKDOWN_KEYS = ("query_language", "modality", "category", "group")
-VISION_MODALITIES = ("figure", "scan")  # evidence lives only in an image: unreachable without M3
+VISION_MODALITIES = ("figure", "scan")  # evidence lives only in an image: unreachable without vision understanding
 
 Page = tuple[str, int]  # (document, PDF page number)
 
@@ -220,7 +220,7 @@ def evaluate(
 def ingest_corpus(
     documents: Iterable[str], client: QdrantClient, embed_batch: EmbedBatch, cache: EmbeddingCache
 ) -> list[dict]:
-    """Ingest the gold-set PDFs with the production pipeline, without MiniMax understanding."""
+    """Ingest the gold-set PDFs with the production pipeline, without vision understanding."""
     ingested = []
     for name in sorted(set(documents)):
         path = DOCS_DIR / name
@@ -232,7 +232,7 @@ def ingest_corpus(
             client=client,
             embed_batch=embed_batch,
             cache=cache,
-            complete=None,  # no MiniMax/M3 in the retrieval benchmark
+            complete=None,  # no vision LLM in the retrieval benchmark
             collection=EVAL_COLLECTION,
         )
         print(f"  {name}: pages={result.pages} chunks={result.chunks} newly_embedded={result.newly_embedded}")
@@ -307,7 +307,7 @@ def build_results(rows: Sequence[dict], corpus: Sequence[dict], ingested: Sequen
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "collection": EVAL_COLLECTION,
-        "scope": "retrieval only, baseline text-extracted corpus (no MiniMax understanding)",
+        "scope": "retrieval only, baseline text-extracted corpus (no vision understanding)",
         "gold": {
             "path": "evals/gold.jsonl",
             "evaluated": len(rows),
@@ -338,7 +338,7 @@ def build_results(rows: Sequence[dict], corpus: Sequence[dict], ingested: Sequen
             "questions": len(vision),
             "ids": [row["record"]["id"] for row in vision],
             "configs": aggregate(vision),
-            "note": "evidence exists only inside page images; unreachable without MiniMax understanding",
+            "note": "evidence exists only inside page images; unreachable without vision understanding",
         },
         "breakdowns": {key: breakdown(headline, key) for key in BREAKDOWN_KEYS},
         "per_question": [
@@ -355,9 +355,9 @@ def build_results(rows: Sequence[dict], corpus: Sequence[dict], ingested: Sequen
             for row in rows
         ],
         "notes": [
-            "Priority 2 retrieval benchmark on the baseline text-extracted corpus: MiniMax understanding "
+            "Priority 2 retrieval benchmark on the baseline text-extracted corpus: vision understanding "
             "was disabled, so this is not an end-to-end RAG evaluation and the numbers are a floor for the "
-            "shipped pipeline, which ingests with M3.",
+            "shipped pipeline, which ingests with it.",
             "Headline metrics cover text-reachable questions only; vision_dependent questions (modality "
             "figure/scan) are reported separately because no retrieval configuration can reach their evidence "
             "in this corpus.",
@@ -403,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.no_ingest:
             # Always the full gold corpus, never just --only's documents: a partial run must not
             # change which distractors the retriever competes against.
-            print(f"Ingesting the gold corpus into {EVAL_COLLECTION} (no MiniMax understanding)")
+            print(f"Ingesting the gold corpus into {EVAL_COLLECTION} (no vision understanding)")
             ingested = ingest_corpus(
                 gold_documents(),
                 client,
