@@ -53,6 +53,8 @@ jobs:
             "bash -s -- '$DEPLOY_SHA'" <<'REMOTE'
           set -euo pipefail
 
+          export PATH="/home/ubuntu/.local/bin:$PATH"
+
           DEPLOY_SHA="$1"
           APP_DIR="/home/ubuntu/projects/multimodal-enterprise-rag"
 
@@ -74,7 +76,7 @@ jobs:
             exit 1
           fi
 
-          /home/ubuntu/.local/bin/uv sync --frozen
+          uv sync --frozen
 
           cd web
           npm ci
