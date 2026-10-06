@@ -1,0 +1,97 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Oracle
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://tarun.runs-on.dev
+
+    steps:
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.OCI_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy exact CI commit
+        env:
+          OCI_HOST: ${{ vars.OCI_HOST }}
+          OCI_USER: ${{ vars.OCI_USER }}
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$OCI_USER@$OCI_HOST" \
+            "bash -s -- '$DEPLOY_SHA'" <<'REMOTE'
+          set -euo pipefail
+
+          DEPLOY_SHA="$1"
+          APP_DIR="/home/ubuntu/projects/multimodal-enterprise-rag"
+
+          cd "$APP_DIR"
+
+          echo "Deploying commit: $DEPLOY_SHA"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "ERROR: production working tree is not clean."
+            git status --short
+            exit 1
+          fi
+
+          git fetch origin main --prune
+          git checkout --detach "$DEPLOY_SHA"
+
+          if [ "$(git rev-parse HEAD)" != "$DEPLOY_SHA" ]; then
+            echo "ERROR: checked-out commit does not match requested SHA."
+            exit 1
+          fi
+
+          uv sync --frozen
+
+          cd web
+          npm ci
+          npm run build
+
+          cd "$APP_DIR"
+
+          sudo -n systemctl restart rag-api.service
+          sudo -n systemctl restart rag-web.service
+
+          sleep 3
+
+          sudo -n systemctl is-active --quiet rag-api.service
+          sudo -n systemctl is-active --quiet rag-web.service
+
+          curl -fsS http://127.0.0.1:8000/api/documents > /dev/null
+          curl -fsS http://127.0.0.1:3000/ > /dev/null
+
+          echo "Deployment successful: $(git rev-parse HEAD)"
+          REMOTE
