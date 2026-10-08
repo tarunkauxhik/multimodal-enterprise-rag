@@ -2,7 +2,9 @@
 
 Retrieval is for questions about document content. Everything else is recognised here first:
 
-- greeting / thanks / ack / farewell / help / followup: answered without the workspace at all.
+- greeting / thanks / ack / farewell / help: answered without the workspace at all.
+- followup ("tell me more"): resolved from earlier turns by rag.contextualize before routing; without
+  earlier turns it gets a clarifying reply.
 - list_documents / page_count: answered from document metadata.
 - overview ("what is this about", "what topics are covered", whole-document summaries): answered
   from the document's opening pages (title, contents, introduction), because semantic retrieval
@@ -13,8 +15,9 @@ Retrieval is for questions about document content. Everything else is recognised
 - term (a lone short token such as "ci"): expanded from the documents' own text when possible.
 - question: everything else, through the full retrieval pipeline.
 
-Routing only chooses which evidence reaches the generator; it never produces document facts, and
-document text never influences it (only the user's message and document names do).
+Routing only chooses which evidence reaches the generator; it never produces document facts.
+Document text never influences it directly: it sees the user's message (or its standalone rewrite,
+rag.contextualize) and document names.
 """
 
 import re
@@ -26,7 +29,7 @@ Intent = Literal[
     "greeting", "thanks", "ack", "farewell", "help", "followup",
     "list_documents", "page_count", "overview", "page", "vague", "term", "question",
 ]
-NO_WORKSPACE = frozenset({"greeting", "thanks", "ack", "farewell", "help", "followup"})
+NO_WORKSPACE = frozenset({"greeting", "thanks", "ack", "farewell", "help"})
 
 
 @dataclass(frozen=True)
@@ -70,9 +73,9 @@ OVERVIEW = re.compile(
     r"|\b(summari[sz]e|summary|sum up|gist|tl;?dr)\b"
     rf"|\bwhat does (it|this|the {DOC_WORDS}|this {DOC_WORDS}) (cover|contain|include|talk about|discuss)\b"
 )
-# A page reference; the number may be invalid (0, negative, huge): respond() explains those
-# instead of sending them to retrieval. Numbers are physical PDF pages, starting at 1.
-PAGE = re.compile(r"\b(?:page|pg|p)\.?\s*(?:no\.?|number|#)?\s*(-?\d{1,9})\b")
+# A page reference, "page 3" or "3rd page"; the number may be invalid (0, negative, huge): respond()
+# explains those instead of sending them to retrieval. Numbers are physical PDF pages, starting at 1.
+PAGE = re.compile(r"\b(?:page|pg|p)\.?\s*(?:no\.?|number|#)?\s*(-?\d{1,9})\b|\b(\d{1,9})(?:st|nd|rd|th)\s+(?:page|pg)\b")
 WHAT_IS_THIS = re.compile(r"\bwhat\b.*\b(this|that|it)\b|^\W*what\W*$")
 
 # Words that carry no topic of their own: a message made only of these is vague.
@@ -159,7 +162,7 @@ def classify(message: str, document_names: list[str] | None = None) -> Route:
     document = named_document(text, names)
     doc_words = set(words(re.sub(r"\.pdf$", "", document.lower()))) | {"pdf"} if document else set()
 
-    pages = tuple(dict.fromkeys(int(n) for n in PAGE.findall(text)))[:3]
+    pages = tuple(dict.fromkeys(int(number or ordinal) for number, ordinal in PAGE.findall(text)))[:3]
     if pages:
         return Route("page", document=document, pages=pages)
     if PAGE_COUNT.search(text):

@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react"
 
-import { api, errorMessage } from "@/lib/api"
-import { replyKind, type ChatResponse } from "@/lib/types"
+import { api, errorMessage, HISTORY_ANSWER_CHARS, HISTORY_TURNS, MAX_QUESTION_CHARS } from "@/lib/api"
+import { replyKind, type ChatResponse, type ChatTurn } from "@/lib/types"
 
 export type Message =
   | { id: string; role: "user"; text: string }
@@ -40,7 +40,18 @@ function load(): Conversation[] {
   }
 }
 
-/** Display history only. Every question is sent on its own (POST /api/chat); earlier turns are never sent. */
+/** The last few answered exchanges before a question, sent with it so the API can resolve a follow-up
+ * ("tell me more", "what about page 4?"). Small talk and failed requests carry no context. */
+export function chatHistory(messages: Message[]): ChatTurn[] {
+  return messages
+    .filter((m): m is Extract<Message, { state: "done" }> =>
+      m.role === "assistant" && m.state === "done" && replyKind(m.response) !== "conversation" && m.question.trim() !== "",
+    )
+    .slice(-HISTORY_TURNS)
+    .map((m) => ({ question: m.question.slice(0, MAX_QUESTION_CHARS), answer: m.response.answer.slice(0, HISTORY_ANSWER_CHARS) }))
+}
+
+/** History lives in this tab (sessionStorage); each question is sent with its last few exchanges (chatHistory). */
 export function useConversations() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -76,9 +87,9 @@ export function useConversations() {
       ),
     )
 
-  const answer = useCallback(async (conversationId: string, messageId: string, question: string) => {
+  const answer = useCallback(async (conversationId: string, messageId: string, question: string, history: ChatTurn[]) => {
     try {
-      const response = await api.chat(question)
+      const response = await api.chat(question, history)
       patch(conversationId, messageId, { id: messageId, role: "assistant", question, state: "done", response })
     } catch (err) {
       patch(conversationId, messageId, { id: messageId, role: "assistant", question, state: "error", error: errorMessage(err, "chat") })
@@ -89,6 +100,7 @@ export function useConversations() {
     (question: string) => {
       const conversationId = activeId ?? crypto.randomUUID()
       const messageId = crypto.randomUUID()
+      const history = chatHistory(active?.messages ?? []) // a new conversation has none
       const turn: Message[] = [
         { id: crypto.randomUUID(), role: "user", text: question },
         { id: messageId, role: "assistant", question, state: "pending" },
@@ -103,18 +115,20 @@ export function useConversations() {
           : [{ id: conversationId, title: question.slice(0, 80), messages: turn }, ...list],
       )
       setActiveId(conversationId)
-      void answer(conversationId, messageId, question)
+      void answer(conversationId, messageId, question, history)
     },
-    [activeId, answer],
+    [activeId, active, answer],
   )
 
   const retry = useCallback(
     (messageId: string, question: string) => {
       if (!activeId) return
+      const messages = active?.messages ?? []
+      const history = chatHistory(messages.slice(0, messages.findIndex((m) => m.id === messageId))) // turns before this one
       patch(activeId, messageId, { id: messageId, role: "assistant", question, state: "pending" })
-      void answer(activeId, messageId, question)
+      void answer(activeId, messageId, question, history)
     },
-    [activeId, answer],
+    [activeId, active, answer],
   )
 
   const remove = useCallback((id: string) => {

@@ -35,7 +35,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client.http.exceptions import ApiException
 
 from rag import session
-from rag.config import QDRANT_COLLECTION
+from rag.config import HISTORY_TURNS, QDRANT_COLLECTION
+from rag.contextualize import Turn
 from rag.extract import document_id_for
 from rag.ingest import IngestReport
 from rag.store import delete_document, list_documents
@@ -92,9 +93,18 @@ class DeleteResponse(BaseModel):
     deleted_points: int
 
 
+class ChatTurn(BaseModel):
+    """One earlier exchange as the browser shows it. Used only to understand a follow-up, never as evidence."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    question: str = Field(min_length=1, max_length=2000)
+    answer: str = Field(max_length=4000)
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     question: str = Field(min_length=1, max_length=2000)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=HISTORY_TURNS)  # earlier turns, oldest first
 
 
 class Citation(BaseModel):
@@ -311,7 +321,8 @@ def create_app(
     @app.post("/api/chat", response_model=ChatResponse)
     def chat(request: ChatRequest) -> ChatResponse:
         try:
-            reply = session.respond(services(), state["collection"], request.question)
+            history = [Turn(t.question, t.answer) for t in request.history]
+            reply = session.respond(services(), state["collection"], request.question, history)
         except ApiException as exc:  # Qdrant: connection failures and error responses
             raise HTTPException(503, f"Vector database unavailable: {redacted(exc)}") from exc
         except Exception as exc:  # embedding, reranking or answer model

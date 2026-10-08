@@ -278,3 +278,15 @@ def test_query_embeddings_use_the_cache(env):
     retriever.dense_search("same question")
     retriever.dense_search("same question")
     assert calls == [["same question"]]
+
+
+def test_a_document_scope_limits_dense_bm25_and_the_result(env):
+    client, cache = env
+    load(client, cache, make_chunks(policy_texts("alpha"), "alpha"), "alpha")
+    load(client, cache, make_chunks(policy_texts("beta"), "beta"), "beta")
+    retriever = Retriever(client, hash_embed, cache, FakeReranker())
+    assert docs_of(retriever.retrieve(QUERY)) == {"alpha", "beta"}
+    assert docs_of(retriever.dense_search(QUERY, document="beta.pdf")) == {"beta"}
+    assert docs_of(retriever.bm25_search(QUERY, document="beta.pdf")) == {"beta"}
+    assert docs_of(retriever.retrieve(QUERY, document="beta.pdf")) == {"beta"}
+    assert retriever.retrieve(QUERY, document="missing.pdf") == []

@@ -11,6 +11,9 @@ Only complete documents are searched: both BM25 and dense search are limited to
 points from finished writes (rag.store.complete_write_ids), so a document whose
 write was cut short by a failure or a restart never takes part.
 
+retrieve(query, document=name) limits both searches to one document (a question that names it,
+or a follow-up about it); fusion and reranking are unchanged.
+
 Usage: uv run python -m rag.retrieve "your question"
 """
 
@@ -109,25 +112,25 @@ class Retriever:
         self.payloads = [p for p in payloads if p.get("write_id") in self.complete_writes]
         self.bm25 = build_bm25(self.payloads)
 
-    def dense_search(self, query: str, top_k: int = DENSE_TOP_K) -> list[Hit]:
+    def dense_search(self, query: str, top_k: int = DENSE_TOP_K, document: str | None = None) -> list[Hit]:
         (vector,), _ = embed_texts([query], EMBED_TASK_QUERY, self.embed_query, self.cache)
         if not self.complete_writes:
             return []
         # Filtered in Qdrant, so the top_k come from complete documents only. A write that starts after
         # the refresh has a new write_id, which is not in the set: its partial points stay invisible.
-        complete_only = models.Filter(
-            must=[models.FieldCondition(key="write_id", match=models.MatchAny(any=sorted(self.complete_writes)))]
-        )
+        must = [models.FieldCondition(key="write_id", match=models.MatchAny(any=sorted(self.complete_writes)))]
+        if document is not None:
+            must.append(models.FieldCondition(key="source_name", match=models.MatchValue(value=document)))
         points = self.client.query_points(
-            self.collection, query=vector, query_filter=complete_only, limit=top_k, with_payload=True
+            self.collection, query=vector, query_filter=models.Filter(must=must), limit=top_k, with_payload=True
         ).points
         return [Hit(p.payload, dense_score=p.score, dense_rank=rank) for rank, p in enumerate(points, start=1)]
 
-    def bm25_search(self, query: str, top_k: int = BM25_TOP_K) -> list[Hit]:
-        return [
-            Hit(payload, bm25_score=score, bm25_rank=rank)
-            for rank, (payload, score) in enumerate(self.bm25.search(query, top_k), start=1)
-        ]
+    def bm25_search(self, query: str, top_k: int = BM25_TOP_K, document: str | None = None) -> list[Hit]:
+        found = self.bm25.search(query, top_k if document is None else len(self.payloads))
+        if document is not None:
+            found = [(payload, score) for payload, score in found if payload["source_name"] == document][:top_k]
+        return [Hit(payload, bm25_score=score, bm25_rank=rank) for rank, (payload, score) in enumerate(found, start=1)]
 
     def rerank_hits(self, query: str, hits: list[Hit], top_n: int = RERANK_TOP_K) -> list[Hit]:
         if not hits:
@@ -139,11 +142,13 @@ class Retriever:
             out.append(hits[index])
         return out
 
-    def retrieve(self, query: str) -> list[Hit]:
+    def retrieve(self, query: str, document: str | None = None) -> list[Hit]:
+        """Top chunks for `query`, from one document (its source_name) when given, else from all."""
         query = query.strip()
         if not query:
             raise ValueError("Query is empty")
-        return self.rerank_hits(query, fuse(self.dense_search(query), self.bm25_search(query)))
+        dense, sparse = self.dense_search(query, document=document), self.bm25_search(query, document=document)
+        return self.rerank_hits(query, fuse(dense, sparse))
 
 
 def main(argv: list[str] | None = None) -> int:

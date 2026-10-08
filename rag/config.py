@@ -32,6 +32,14 @@ UNDERSTAND_REASONING_EFFORT = "low"
 GENERATION_MAX_TOKENS = 4096  # not benchmarked
 UNDERSTAND_MAX_TOKENS = 8192  # page transcription can be long; not benchmarked
 UNDERSTAND_DPI = 150  # page render resolution sent to the vision model (PNG; xAI accepts PNG/JPEG up to 20 MiB)
+# Follow-up rewriting (rag.contextualize): one short call, only for messages that have earlier turns.
+# Measured with grok-4.7 at low effort: median ~2 s per rewrite, with rare spikes of 20-40 s, hence one
+# attempt and a short timeout; on any failure the original message is used.
+HISTORY_TURNS = 3  # earlier exchanges used to resolve a follow-up
+HISTORY_ANSWER_CHARS = 1500  # each earlier answer is cut to this length in the rewrite prompt
+REWRITE_REASONING_EFFORT = "low"
+REWRITE_MAX_TOKENS = 300  # one standalone request
+REWRITE_TIMEOUT = 15.0  # seconds
 
 GEMINI_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768

@@ -27,6 +27,12 @@ export interface IngestAccepted {
   status: "queued" | "ready"
 }
 
+/** An earlier exchange, sent so the API can understand a follow-up ("tell me more"). Never used as evidence. */
+export interface ChatTurn {
+  question: string
+  answer: string
+}
+
 export interface Citation {
   document: string
   page: number

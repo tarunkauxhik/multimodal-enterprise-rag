@@ -1,6 +1,7 @@
 import { describe as group, expect, it, vi } from "vitest"
 
-import { api, ApiError, errorMessage } from "@/lib/api"
+import { chatHistory, type Message } from "@/hooks/use-conversations"
+import { api, ApiError, errorMessage, HISTORY_ANSWER_CHARS, HISTORY_TURNS } from "@/lib/api"
 import { numberCitations } from "@/lib/citations"
 import { emojiKey, splitEmoji } from "@/lib/emoji"
 import { parsePassage, passagePreview } from "@/lib/passage"
@@ -12,13 +13,17 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } })
 
 group("api client", () => {
-  it("sends only the current question to /api/chat", async () => {
-    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(json(answer()))
+  it("sends the question and its earlier exchanges to /api/chat", async () => {
+    // a fresh Response per call: a body can be read only once
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => json(answer()))
     await api.chat("What was revenue?")
     const [url, init] = fetch.mock.calls[0]
     expect(url).toBe("/api/chat")
     expect(init?.method).toBe("POST")
-    expect(JSON.parse(init?.body as string)).toEqual({ question: "What was revenue?" })
+    expect(JSON.parse(init?.body as string)).toEqual({ question: "What was revenue?", history: [] })
+    const history = [{ question: "What is this about?", answer: "An annual report [a.pdf, Page 1]." }]
+    await api.chat("tell me more", history)
+    expect(JSON.parse(fetch.mock.calls[1][1]?.body as string)).toEqual({ question: "tell me more", history })
   })
 
   it("keeps the server detail but maps status codes to user messages", async () => {
@@ -142,4 +147,27 @@ it("sorts documents: in progress, then needing attention, then ready", () => {
 it("right-aligns numeric columns, never the row-label column", () => {
   expect(numericColumns([["2024", "₹1,200 cr", "12.5%", "n/a"], ["2025", "(300)", "—", "7"]])).toEqual([false, true, true, false])
   expect(numericColumns([["Revenue", ""], ["Profit", "-"]])).toEqual([false, false])
+})
+
+group("chat history sent with a question", () => {
+  const done = (question: string, response = answer()): Message => ({ id: question, role: "assistant", question, state: "done", response })
+
+  it("keeps the last answered exchanges, without small talk, errors or pending replies", () => {
+    const messages: Message[] = [
+      { id: "u0", role: "user", text: "hi" },
+      done("hi", answer({ answer: "Hey", kind: "conversation", citations: [], sources: [] })),
+      ...Array.from({ length: HISTORY_TURNS + 1 }, (_, i) => done(`question ${i}`)),
+      { id: "e", role: "assistant", question: "failed", state: "error", error: "Something went wrong." },
+      done("not found", answer({ answer: "I couldn't find enough.", abstained: true, kind: "abstain", citations: [], sources: [] })),
+      { id: "p", role: "assistant", question: "pending", state: "pending" },
+    ]
+    const history = chatHistory(messages)
+    expect(history.map((t) => t.question)).toEqual(["question 2", "question 3", "not found"]) // abstentions still give context
+    expect(history).toHaveLength(HISTORY_TURNS)
+  })
+
+  it("cuts long answers to the size the API accepts", () => {
+    const [turn] = chatHistory([done("long", answer({ answer: "x".repeat(HISTORY_ANSWER_CHARS + 900) }))])
+    expect(turn.answer).toHaveLength(HISTORY_ANSWER_CHARS)
+  })
 })

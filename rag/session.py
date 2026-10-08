@@ -2,7 +2,8 @@
 
 build_services creates the API clients once; ingest_upload and answer_question run the
 unchanged rag/ pipeline against whichever collection the caller names. respond is the chat entry
-point: it routes each message first (rag.route) and retrieves only for document-content questions.
+point: it rewrites follow-ups into standalone requests when earlier turns are given
+(rag.contextualize), routes each message (rag.route) and retrieves only for document-content questions.
 The API uses one shared collection (API_COLLECTION, default QDRANT_COLLECTION, the one the CLI
 writes to).
 
@@ -20,7 +21,7 @@ SQLite caches are not shared: they are opened per operation.
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -35,8 +36,12 @@ from rag.config import (
     UNDERSTAND_CACHE_PATH,
     UNDERSTAND_MAX_TOKENS,
     UNDERSTAND_REASONING_EFFORT,
+    REWRITE_MAX_TOKENS,
+    REWRITE_REASONING_EFFORT,
+    REWRITE_TIMEOUT,
     load_settings,
 )
+from rag.contextualize import Turn, contextualize
 from rag.embed import EmbedBatch, EmbeddingCache, gemini_embedder
 from rag.generate import Answer, Complete, generate_answer, llm_client
 from rag.route import NO_WORKSPACE, WHAT_IS_THIS, Route, classify, expand_term, normalize
@@ -61,6 +66,7 @@ class Services:
     rerank: Rerank
     answer_model: Complete
     understand_model: Complete
+    rewrite_model: Complete | None = None  # follow-up rewriting (rag.contextualize); None: messages are used as typed
     embed_cache_path: Path = EMBED_CACHE_PATH
     understanding_cache_path: Path = UNDERSTAND_CACHE_PATH
     secrets: tuple[str, ...] = ()  # redacted from any error shown to users
@@ -76,6 +82,11 @@ def build_services() -> Services:
         answer_model=llm_client(s.xai_api_key, s.xai_base_url, reasoning_effort=GENERATION_REASONING_EFFORT),
         understand_model=llm_client(
             s.xai_api_key, s.xai_base_url, max_tokens=UNDERSTAND_MAX_TOKENS, reasoning_effort=UNDERSTAND_REASONING_EFFORT
+        ),
+        # One attempt and a short timeout: a slow rewrite falls back to the message as typed.
+        rewrite_model=llm_client(
+            s.xai_api_key, s.xai_base_url, max_tokens=REWRITE_MAX_TOKENS, reasoning_effort=REWRITE_REASONING_EFFORT,
+            attempts=1, timeout=REWRITE_TIMEOUT,
         ),
         secrets=tuple(k for k in (s.xai_api_key, s.gemini_api_key, s.jina_api_key, s.qdrant_api_key) if k),
     )
@@ -225,8 +236,6 @@ CONVERSATION = {
     "farewell": "See you.",
     "help": "I answer questions about the documents in this workspace, citing the pages I use. "
     "Ask about a topic, a table or a specific page, or ask for an overview.",
-    "followup": "I answer each question on its own, so I don't have the previous one. "
-    "Tell me the topic again and I'll go deeper.",
 }
 EMPTY_WORKSPACE = "There are no documents here yet, so there's nothing to answer from. Add a PDF and ask again."
 UNCLEAR = "Which part do you mean? Give me a topic, a page, or a question and I'll dig in."
@@ -278,12 +287,23 @@ def _overview(name: str) -> str:
     return f"Give me an overview of {name}"
 
 
-def respond(services: Services, collection: str, message: str) -> Reply:
+def _as_asked(typed: str, standalone: str) -> str:
+    """The question the generator answers: the user's own words, plus their standalone reading when a
+    follow-up was rewritten. The answer follows what was typed (format, language, scope), while the
+    reading says what "it" or "the next page" refers to. Retrieval uses the reading alone."""
+    return typed if standalone == typed else f"{typed}\n(In this conversation: {standalone})"
+
+
+def respond(services: Services, collection: str, message: str, history: Sequence[Turn] = ()) -> Reply:
     """Answer one chat message: route it (rag.route), then use only the evidence that route needs.
 
-    Conversation replies touch nothing. Metadata and clarifications read the stored chunk payloads.
-    Overview and page questions send chosen chunks to the same grounded generator as retrieval, so
-    citation validation and abstention apply unchanged. Everything else is the full pipeline.
+    Conversation replies touch nothing. With earlier turns (`history`, oldest first), any other
+    message is first rewritten into a standalone request (rag.contextualize), so "tell me more" or
+    "what about page 4?" is routed and retrieved like a first message; history is never evidence.
+    Metadata and clarifications read the stored chunk payloads. Overview and page questions send
+    chosen chunks to the same grounded generator as retrieval, so citation validation and
+    abstention apply unchanged. Everything else is the full pipeline, limited to one document when
+    the (rewritten) message names it.
     """
     route = classify(message)
     if route.intent in NO_WORKSPACE:
@@ -299,7 +319,14 @@ def respond(services: Services, collection: str, message: str) -> Reply:
         for p in payloads:
             last_page[p["source_name"]] = max(last_page.get(p["source_name"], 0), int(p["page_number"]))
         names = sorted(last_page)
+        typed = message
+        message = contextualize(message, history, names, services.rewrite_model)  # unchanged without history
+        asked = _as_asked(typed, message)  # what the generator answers
         route = classify(message, names)
+        if route.intent in NO_WORKSPACE:  # the rewrite kept a social message as it was
+            return Reply("conversation", CONVERSATION[route.intent])
+        if route.intent == "followup":  # nothing earlier to continue from: ask, as for a vague message
+            route = Route("vague", document=route.document)
         scope = [route.document] if route.document else names
 
         # Only pages with indexed text are known (the PDF's own page count is not stored), so replies
@@ -358,7 +385,7 @@ def respond(services: Services, collection: str, message: str) -> Reply:
         if route.intent == "overview":
             (name,) = scope
             chunks = sorted((p for p in payloads if p["source_name"] == name), key=_chunk_order)
-            return _answer_reply(generate_answer(message, overview_evidence(chunks), services.answer_model))
+            return _answer_reply(generate_answer(asked, overview_evidence(chunks), services.answer_model))
         if route.intent == "page":
             pages = [n for n in route.pages if n >= 1]
             if not pages:
@@ -374,14 +401,14 @@ def respond(services: Services, collection: str, message: str) -> Reply:
                                               f"The furthest is **{_md(longest)}**, up to page {last_page[longest]}.")
                 where = f" of **{_md(scope[0])}**" if len(scope) == 1 else ""
                 return Reply("workspace", f"Page {page}{where} has no text I can read.")
-            return _answer_reply(generate_answer(message, chunks[:CONTEXT_LIMIT], services.answer_model))
+            return _answer_reply(generate_answer(asked, chunks[:CONTEXT_LIMIT], services.answer_model))
 
-        question = route.query or message
-        hits = retriever.retrieve(question)
+        query = route.query or message  # retrieval uses the standalone reading
+        hits = retriever.retrieve(query, document=route.document)
     finally:
         embed_cache.close()
     touch_session(services.client, collection)
-    return _answer_reply(generate_answer(question, [h.payload for h in hits], services.answer_model))
+    return _answer_reply(generate_answer(route.query or asked, [h.payload for h in hits], services.answer_model))
 
 
 def redact(message: str, secrets: Iterable[str]) -> str:

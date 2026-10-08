@@ -1,10 +1,12 @@
 // The only place the UI talks to the backend. Requests go to same-origin /api/*, which the
 // Next.js server forwards to FastAPI (app/api/[...path]/route.ts).
 
-import type { ChatResponse, DocumentSummary, Health, IngestAccepted } from "@/lib/types"
+import type { ChatResponse, ChatTurn, DocumentSummary, Health, IngestAccepted } from "@/lib/types"
 
 export const MAX_UPLOAD_MB = 200 // matches the API default (API_MAX_UPLOAD_MB)
 export const MAX_QUESTION_CHARS = 2000 // matches ChatRequest in api.py
+export const HISTORY_TURNS = 3 // earlier exchanges sent with a question; matches HISTORY_TURNS in rag/config.py
+export const HISTORY_ANSWER_CHARS = 1500 // each earlier answer is cut to this (HISTORY_ANSWER_CHARS in rag/config.py)
 export const UNREACHABLE_HEADER = "x-rag-unreachable" // set by the proxy when FastAPI does not answer
 
 /** status 0: the document service could not be reached at all. */
@@ -79,11 +81,12 @@ export const api = {
   deleteDocument: (documentId: string) =>
     request<unknown>(`/api/documents/${encodeURIComponent(documentId)}`, { method: "DELETE" }),
 
-  chat: (question: string, signal?: AbortSignal) =>
+  /** `history`: the last few exchanges (hooks/use-conversations chatHistory), for resolving follow-ups. */
+  chat: (question: string, history: ChatTurn[] = [], signal?: AbortSignal) =>
     request<ChatResponse>("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ question }), // single-turn: earlier messages are never sent
+      body: JSON.stringify({ question, history }),
       signal,
     }),
 

@@ -155,7 +155,7 @@ def test_unique_source_name_keeps_citations_unambiguous():
     assert session.unique_source_name("README", ["README"]) == "README (2)"
 
 
-def test_llm_clients_use_xai_settings_and_reasoning_effort_per_role(monkeypatch):
+def test_llm_clients_use_xai_settings_and_settings_per_role(monkeypatch):
     for name in ("XAI_API_KEY", "GEMINI_API_KEY", "JINA_API_KEY"):
         monkeypatch.setenv(name, "test-key")
     monkeypatch.delenv("XAI_BASE_URL", raising=False)
@@ -164,8 +164,10 @@ def test_llm_clients_use_xai_settings_and_reasoning_effort_per_role(monkeypatch)
     monkeypatch.setattr(session, "load_settings", lambda: config.load_settings(env_file=None))  # ignore a local .env
     monkeypatch.setattr(session, "QdrantClient", lambda **kwargs: None)  # offline: no server version check
     session.build_services()
-    (answer_args, answer_kwargs), (understand_args, understand_kwargs) = calls
-    assert answer_args == understand_args == ("test-key", "https://api.x.ai/v1")
+    (answer_args, answer_kwargs), (understand_args, understand_kwargs), (rewrite_args, rewrite_kwargs) = calls
+    assert answer_args == understand_args == rewrite_args == ("test-key", "https://api.x.ai/v1")
+    assert rewrite_kwargs == {"max_tokens": config.REWRITE_MAX_TOKENS, "reasoning_effort": config.REWRITE_REASONING_EFFORT,
+                              "attempts": 1, "timeout": config.REWRITE_TIMEOUT}  # a slow rewrite gives up, never retries
     assert answer_kwargs["reasoning_effort"] == config.GENERATION_REASONING_EFFORT
     assert understand_kwargs["reasoning_effort"] == config.UNDERSTAND_REASONING_EFFORT
     assert understand_kwargs["max_tokens"] == config.UNDERSTAND_MAX_TOKENS

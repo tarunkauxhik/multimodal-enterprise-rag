@@ -3,6 +3,7 @@
 import pytest
 
 from rag import session
+from rag.contextualize import Turn
 from rag.generate import ABSTAIN_MESSAGE, SCOPE_MESSAGE
 from rag.route import classify, expand_term
 from tests.conftest import RecordingModel, build_text_pdf, hash_embed
@@ -26,6 +27,7 @@ DOCS = ["Aptitude B.tech. VIth sem Booklet (1).pdf", "sample.pdf"]
         ("How many pages does it have?", "page_count"), ("what is this PDF called?", "list_documents"),
         ("page 72", "page"), ("tell me about page 72", "page"), ("what's on pg 72?", "page"), ("page 0", "page"),
         ("what is on page 72?", "page"), ("What does the table on page 3 show?", "page"),
+        ("What is the 3rd page about", "page"), ("summarize the 12th page", "page"), ("I came 3rd place", "question"),
         ("What is compound interest?", "question"), ("hi, what is compound interest?", "question"),
         ("Summarize the section on compound interest", "question"),
         ("What is the capital of France?", "question"),
@@ -74,7 +76,7 @@ def workspace(fake_services, sample_pdf):
     return fake_services
 
 
-@pytest.mark.parametrize("message", ["hi", "thanks", "ok", "bye", "who are you?", "tell me more"])
+@pytest.mark.parametrize("message", ["hi", "thanks", "ok", "bye", "who are you?"])
 def test_conversation_never_touches_the_workspace_or_the_model(fake_services, monkeypatch, message):
     monkeypatch.setattr(session, "Retriever", NoRetriever)
     reply = session.respond(fake_services, "ws", message)
@@ -249,3 +251,101 @@ def test_overview_evidence_keeps_short_chunks_when_slots_remain():
     chunks = [{"chunk_id": f"d-p{n}-{n}", "page_number": n, "section_path": ["Policy"], "text": text}
               for n, text in enumerate(["Travel Policy", "Hotels: 180 EUR in Tier 1.", "Meals: 55 EUR a day.", "Approvals by a director."], start=1)]
     assert [c["page_number"] for c in session.overview_evidence(chunks)] == [1, 2, 3, 4]  # a short document is used whole
+
+
+# --- follow-ups: earlier turns are resolved by one rewrite, then the unchanged paths answer ------
+
+OVERVIEW_TURN = [Turn("What is this PDF about?", "An annual report on company results [sample.pdf, Page 1].")]
+
+
+def test_a_first_message_is_never_rewritten(workspace):
+    workspace.rewrite_model = RecordingModel("must not be called")
+    session.respond(workspace, "ws", "What was revenue in 2025?")
+    assert workspace.rewrite_model.calls == []
+
+
+def test_tell_me_more_without_earlier_turns_asks_what_to_continue(workspace):
+    reply = session.respond(workspace, "ws", "tell me more")
+    assert reply.kind == "clarify" and "sample.pdf" in reply.text and reply.suggestions == ["Give me an overview of sample.pdf"]
+    assert workspace.answer_model.calls == []
+
+
+def test_small_talk_in_a_conversation_is_not_rewritten(workspace):
+    workspace.rewrite_model = RecordingModel("must not be called")
+    assert session.respond(workspace, "ws", "thanks", OVERVIEW_TURN).kind == "conversation"
+    assert workspace.rewrite_model.calls == []
+
+
+def test_a_follow_up_about_the_next_page_uses_that_page(workspace):
+    workspace.rewrite_model = RecordingModel("What is on page 2 of sample.pdf?")
+    workspace.answer_model = RecordingModel("Next year's plans [sample.pdf, Page 2].")
+    history = [Turn("what is on page 1?", "Revenue and profit for 2024 and 2025 [sample.pdf, Page 1].")]
+    reply = session.respond(workspace, "ws", "and the next page?", history)
+    assert reply.kind == "answer" and reply.citations == [("sample.pdf", 2)]
+    (rewrite,) = workspace.rewrite_model.calls
+    assert "Latest message: and the next page?" in rewrite[1]["content"] and "[sample.pdf, Page 1]" in rewrite[1]["content"]
+    (answer,) = workspace.answer_model.calls
+    assert 'page="2"' in answer[1]["content"] and 'page="1"' not in answer[1]["content"]
+    # the generator answers what was typed, with its resolved reading alongside
+    assert "Question: and the next page?\n(In this conversation: What is on page 2 of sample.pdf?)" in answer[1]["content"]
+    assert workspace.embed_query.calls == 0
+
+
+def test_tell_me_more_continues_the_same_document_through_retrieval(workspace):
+    workspace.rewrite_model = RecordingModel("What are the financial results described in sample.pdf?")
+    reply = session.respond(workspace, "ws", "Ok nga what's more", OVERVIEW_TURN)
+    assert reply.kind == "answer" and reply.citations == [("sample.pdf", 1)]
+    assert workspace.embed_query.calls == 1  # the rewritten request went through hybrid retrieval
+    (answer,) = workspace.answer_model.calls
+    assert "Question: Ok nga what's more\n(In this conversation: What are the financial results described in sample.pdf?)" in answer[1]["content"]
+
+
+def test_an_unchanged_message_reaches_the_generator_as_typed(workspace):
+    workspace.rewrite_model = RecordingModel("What was revenue in 2025?")  # self-contained: returned unchanged
+    session.respond(workspace, "ws", "What was revenue in 2025?", OVERVIEW_TURN)
+    (answer,) = workspace.answer_model.calls
+    assert "Question: What was revenue in 2025?\n\n" in answer[1]["content"] and "In this conversation" not in answer[1]["content"]
+
+
+def test_a_follow_up_can_resolve_to_an_overview(workspace):
+    workspace.rewrite_model = RecordingModel("Give me an overview of sample.pdf")
+    workspace.answer_model = RecordingModel("An annual report [sample.pdf, Page 1].")
+    reply = session.respond(workspace, "ws", "do tell me more about this pdf", [Turn("hi there, anything?", "👍")])
+    assert reply.kind == "answer" and workspace.embed_query.calls == 0  # the overview path, not a search
+
+
+def test_a_new_question_in_a_conversation_is_answered_on_its_own(workspace):
+    workspace.rewrite_model = RecordingModel("What is the capital of France?")  # unrelated: returned unchanged
+    workspace.answer_model = RecordingModel("OUT_OF_SCOPE")
+    reply = session.respond(workspace, "ws", "What is the capital of France?", OVERVIEW_TURN)
+    assert (reply.kind, reply.text, reply.citations) == ("out_of_scope", SCOPE_MESSAGE, [])
+
+
+def test_history_is_never_evidence(workspace):
+    workspace.rewrite_model = RecordingModel("What was the profit in 2025 in sample.pdf?")
+    workspace.answer_model = RecordingModel("INSUFFICIENT_CONTEXT")
+    history = [Turn("What was the profit?", "Profit was 999 million [sample.pdf, Page 1].")]
+    reply = session.respond(workspace, "ws", "and in 2025?", history)
+    assert reply.kind == "abstain" and reply.text == ABSTAIN_MESSAGE
+    (answer,) = workspace.answer_model.calls
+    assert "999" not in answer[1]["content"]  # earlier answers reach the rewrite, never the generator
+
+
+def test_a_failed_rewrite_falls_back_to_the_message_as_typed(workspace):
+    workspace.rewrite_model = RecordingModel(RuntimeError("LLM completion failed: ReadTimeout"))
+    reply = session.respond(workspace, "ws", "What was revenue in 2025?", OVERVIEW_TURN)
+    assert reply.kind == "answer" and len(workspace.rewrite_model.calls) == 1
+
+
+def test_a_question_naming_a_document_retrieves_only_from_it(workspace, monkeypatch):
+    other = build_text_pdf(["Revenue policy for the library fines in 2025.", "Revenue from fines was 7 in 2025."])
+    session.ingest_upload(workspace, "ws", other, "library_rules.pdf")
+    scopes = []
+    retrieve = session.Retriever.retrieve
+    monkeypatch.setattr(session.Retriever, "retrieve", lambda self, q, document=None: scopes.append(document) or retrieve(self, q, document))
+
+    session.respond(workspace, "ws", "What was revenue in 2025 according to the sample.pdf report?")
+    (answer,) = workspace.answer_model.calls
+    assert 'document="sample.pdf"' in answer[1]["content"] and "library_rules.pdf" not in answer[1]["content"]
+    session.respond(workspace, "ws", "What was revenue in 2025?")
+    assert scopes == ["sample.pdf", None]  # no document named: the whole workspace is searched

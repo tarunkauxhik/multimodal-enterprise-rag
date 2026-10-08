@@ -61,6 +61,7 @@ Pages are rendered at 150 DPI as PNG. The model's output is stored as **document
 - **RRF over ranks.** Dense and BM25 scores are not comparable, so they are fused by rank (k=60).
 - **Untrusted context.** Retrieved text is sent inside delimited `<source>` blocks, with the rules restated after it, so instructions hidden in a PDF are ignored.
 - **Citation validation.** Each `[document, Page N]` must match a retrieved chunk. A bare `[Page N]` is accepted only if exactly one document has that page. Invalid citations are removed; if none remain, the system answers `INSUFFICIENT_CONTEXT`.
+- **Follow-ups.** The browser sends the last 3 exchanges with each question. When there are earlier turns, one short model call rewrites the message into a standalone request ("tell me more" → "What are the functional requirements in SRS.pdf?", "and the next page?" → "What is on page 4 of SRS.pdf?"), which then goes through the same routing, retrieval and citation checks as a first message; the answer step sees the message as typed plus that reading. First messages skip it. Earlier answers only shape the request; they are never evidence.
 - **Low reasoning effort.** Grok 4.7 always reasons and cannot switch it off; it returns the reasoning in a separate `reasoning_content` field that the app never reads, so the answer text is not cut. Answers and page understanding run with `reasoning_effort="low"` (grounded extraction from supplied text or one page image needs little deliberation; lower latency and cost). Any `<think>` block in the reply text is still stripped as a safeguard.
 
 ## Design choices
@@ -105,6 +106,7 @@ rag/
   bm25.py           Unicode-aware BM25
   retrieve.py       dense + BM25 -> RRF -> rerank
   rerank.py         Jina client
+  contextualize.py  follow-up rewriting from earlier turns (one short model call, only after the first message)
   route.py          deterministic chat routing before retrieval (no model call)
   generate.py       grounded prompt, citation validation, LLM client
   ingest.py         ingestion pipeline + CLI
@@ -227,7 +229,7 @@ The units assume the checkout at `/opt/multimodal-enterprise-rag`, run as user `
 - Legacy non-Unicode Hindi fonts (e.g. Arjun, BHARTIYA-HINDI_081) extract as Latin gibberish. Pages that are mostly legacy text are re-read by the vision model; an English page with only a little legacy text (a Hindi heading, say) keeps that text as gibberish.
 - Unicode Hindi extraction drops parts of some conjuncts and doubles some vowel signs, which weakens BM25.
 - Routing thresholds are heuristic: uncaptioned or decorative images can still reach the vision model, and vector-drawn charts are missed.
-- The API is single-turn. The web app displays the conversation history (kept in the browser tab's sessionStorage), but each question is answered on its own: follow-ups such as "tell me more" cannot use previous turns yet, and the assistant says so. Bounded conversation context is a planned V2 capability.
+- Follow-ups see only the last 3 answered exchanges, and only to rewrite the request: a reference further back is lost. The rewrite costs one extra model call (about 2 s) on every non-small-talk message after the first, and a first message cannot point back to anything ("tell me more" as an opening message gets a clarifying question).
 - Citation validation checks that every cited (document, page) was actually supplied to the model, not that the page entails the sentence. The prompt forbids conclusions, judgements and recommendations the sources do not state (e.g. "which is better for a borrower" now abstains), but a model can still paraphrase beyond its evidence; claim-level verification is future work.
 - Page numbers are physical PDF pages starting at 1, which can differ from the page labels printed in a book or its table of contents. Only pages with indexed text are known ("N indexed pages"); the PDF's total page count is not stored.
 - Routing is deterministic and heuristic: unusual phrasings of small talk or metadata questions fall through to the full pipeline (the safe default). Clearly unrelated questions are refused by the generator after retrieval, so they still cost one retrieval and one model call.

@@ -43,7 +43,7 @@ it("answers with numbered citations and grouped, plain-text sources", async () =
   renderWorkspace(<ChatView />)
   const user = await ask("What was revenue?")
 
-  expect(api.chat).toHaveBeenCalledWith("What was revenue?")
+  expect(api.chat).toHaveBeenCalledWith("What was revenue?", []) // a first question has no history
   const sources = await screen.findByRole("region", { name: "Sources" })
   // two passages from the same page are one source
   expect(within(sources).getAllByRole("button")).toHaveLength(1)
@@ -116,7 +116,7 @@ it("sends with Enter, adds a newline with Shift+Enter, and lists the conversatio
   await user.type(box, "first line{Shift>}{Enter}{/Shift}second")
   expect(api.chat).not.toHaveBeenCalled()
   await user.keyboard("{Enter}")
-  expect(api.chat).toHaveBeenCalledWith("first line\nsecond")
+  expect(api.chat).toHaveBeenCalledWith("first line\nsecond", [])
   expect(box).toHaveValue("")
   expect(await screen.findByRole("button", { name: /^first line/ })).toBeInTheDocument() // sidebar history
 })
@@ -155,7 +155,7 @@ it("offers starter questions about the ready documents", async () => {
   renderWorkspace(<ChatView />)
   const suggestions = await screen.findByRole("list", { name: "Suggested questions" })
   await userEvent.setup().click(within(suggestions).getByRole("button", { name: /Summarize the key points of Travel Policy\.pdf/ }))
-  expect(api.chat).toHaveBeenCalledWith("Summarize the key points of Travel Policy.pdf")
+  expect(api.chat).toHaveBeenCalledWith("Summarize the key points of Travel Policy.pdf", [])
 })
 
 it("reopens the conversation that was open before a reload", async () => {
@@ -167,4 +167,18 @@ it("reopens the conversation that was open before a reload", async () => {
   renderWorkspace(<ChatView />)
   expect(await screen.findByRole("heading", { level: 2, name: "Earlier question" })).toBeInTheDocument()
   expect(screen.getByRole("region", { name: "Sources" })).toBeInTheDocument()
+})
+
+it("sends earlier exchanges with a follow-up, so it can be understood", async () => {
+  const api = mockApi()
+  api.chat.mockResolvedValueOnce({ answer: "Hello there.", abstained: false, citations: [], sources: [], kind: "conversation" })
+  renderWorkspace(<ChatView />)
+  await ask("hi")
+  await screen.findByText("Hello there.")
+  await ask("What was revenue?")
+  await screen.findByRole("region", { name: "Sources" })
+  await ask("tell me more")
+  await waitFor(() => expect(api.chat).toHaveBeenCalledTimes(3))
+  expect(api.chat).toHaveBeenNthCalledWith(2, "What was revenue?", []) // small talk is not context
+  expect(api.chat).toHaveBeenNthCalledWith(3, "tell me more", [{ question: "What was revenue?", answer: answer().answer }])
 })

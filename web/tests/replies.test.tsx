@@ -39,7 +39,9 @@ it("offers one-tap follow-ups with a clarification", async () => {
   const user = await ask("ci")
   const followUps = await screen.findByRole("group", { name: "Suggested follow-ups" })
   await user.click(within(followUps).getByRole("button", { name: "What is Compound Interest?" }))
-  expect(api.chat).toHaveBeenLastCalledWith("What is Compound Interest?")
+  expect(api.chat).toHaveBeenLastCalledWith("What is Compound Interest?", [
+    { question: "ci", answer: "Do you mean CI (Compound Interest)? I can pull up the relevant section." }, // the clarification is context
+  ])
 })
 
 it("renders workspace answers as formatted text without Markdown symbols", async () => {

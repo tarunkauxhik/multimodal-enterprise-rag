@@ -268,7 +268,31 @@ def test_raw_model_output_never_reaches_the_response(api, sample_pdf):
         assert "PRIVATE-REASONING" not in response.text and "UNGROUNDED-CLAIM" not in response.text
 
 
-@pytest.mark.parametrize("payload", [{"question": "   "}, {"question": ""}, {}, {"question": "ok", "debug": True}])
+TURN = {"question": "What is this PDF about?", "answer": "An annual report [sample.pdf, Page 1]."}
+
+
+def test_chat_passes_earlier_turns_to_the_follow_up_rewrite(api, sample_pdf):
+    ingested(api, sample_pdf)
+    api.services.rewrite_model = RecordingModel("What are the financials in sample.pdf?")
+    body = api.post("/api/chat", json={"question": "tell me more", "history": [TURN]}).json()
+    assert body["kind"] == "answer"
+    (rewrite,) = api.services.rewrite_model.calls
+    assert "User: What is this PDF about?" in rewrite[1]["content"] and "Latest message: tell me more" in rewrite[1]["content"]
+    api.post("/api/chat", json={"question": "What was revenue in 2025?"})  # no history: no rewrite
+    assert len(api.services.rewrite_model.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"question": "   "}, {"question": ""}, {}, {"question": "ok", "debug": True},
+        {"question": "ok", "history": [TURN] * 4},  # more earlier turns than are used
+        {"question": "ok", "history": [{**TURN, "sources": []}]},  # unknown field in a turn
+        {"question": "ok", "history": [{**TURN, "answer": "x" * 4001}]},
+        {"question": "ok", "history": [{**TURN, "question": " "}]},
+        {"question": "ok", "history": "What is this PDF about?"},
+    ],
+)
 def test_invalid_chat_requests_are_422(api, payload):
     assert api.post("/api/chat", json=payload).status_code == 422
 
