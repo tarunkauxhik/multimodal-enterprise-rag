@@ -84,16 +84,45 @@ jobs:
 
           cd "$APP_DIR"
 
-          sudo -n systemctl restart rag-api.service
+                    sudo -n systemctl restart rag-api.service
           sudo -n systemctl restart rag-web.service
 
-          sleep 3
+          echo "Waiting for API..."
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8000/api/documents > /dev/null; then
+              echo "API is ready."
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: API did not become ready within 30 seconds."
+              sudo -n systemctl status rag-api.service --no-pager -l
+              sudo -n journalctl -u rag-api.service -n 50 --no-pager
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          echo "Waiting for web..."
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3000/ > /dev/null; then
+              echo "Web is ready."
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: Web did not become ready within 30 seconds."
+              sudo -n systemctl status rag-web.service --no-pager -l
+              sudo -n journalctl -u rag-web.service -n 50 --no-pager
+              exit 1
+            fi
+
+            sleep 1
+          done
 
           sudo -n systemctl is-active --quiet rag-api.service
           sudo -n systemctl is-active --quiet rag-web.service
-
-          curl -fsS http://127.0.0.1:8000/api/documents > /dev/null
-          curl -fsS http://127.0.0.1:3000/ > /dev/null
 
           echo "Deployment successful: $(git rev-parse HEAD)"
           REMOTE
