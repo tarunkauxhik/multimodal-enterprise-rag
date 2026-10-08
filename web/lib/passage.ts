@@ -9,6 +9,7 @@
 //   when they sit between two words ("S No****TOPIC" -> "S No TOPIC");
 // - single *x* / _x_ are unwrapped only as a pair at word boundaries; "______" blanks stay;
 // - Markdown escapes (\* \| \_ …) are unescaped; links keep their text, images are dropped;
+// - highlight and underline spans (<mark>x</mark>, <u>x</u>) keep their text; the PDF's colour is not shown;
 // - <sup>/<sub> become real super/subscripts only in the extraction shape (VI<sup>th</sup>, H<sub>2</sub>O,
 //   see inline()); "<sup>literal text</sup>" and any other tag-like text stay literal text.
 
@@ -24,6 +25,8 @@ const WORD = /[\p{L}\p{N}]/u
 /** Removes extraction artifacts from one piece of text. <sup>/<sub> tags are kept for inline(). */
 export function cleanText(input: string): string {
   let s = input.replace(/<br\s*\/?>/gi, "\n")
+  // Highlighted / underlined spans (<u><mark>text</mark></u>, one line, no inner tags): keep the text.
+  s = s.replace(/<mark>([^<>\n]*)<\/mark>/gi, "$1").replace(/<u>([^<>\n]*)<\/u>/gi, "$1")
   // A link or image target, allowing one level of nested parentheses: (javascript:alert(1)).
   const target = String.raw`\((?:[^()\n]|\([^()\n]*\))*\)`
   s = s.replace(new RegExp(String.raw`!\[[^\]\n]*\]` + target, "g"), "") // images: nothing to show

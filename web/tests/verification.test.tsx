@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react"
 import { describe as group, expect, it } from "vitest"
 
 import { Passage } from "@/components/sources/passage"
-import { FIGURE_CAPTION, parsePassage } from "@/lib/passage"
+import { FIGURE_CAPTION, parsePassage, passagePreview } from "@/lib/passage"
 
 group("source text: meaningful text stays, artifacts go, HTML stays inert", () => {
   it.each([
@@ -35,6 +35,44 @@ group("source text: meaningful text stays, artifacts go, HTML stays inert", () =
     expect(container).toHaveTextContent("<em>not</em> <div>markup</div>")
     expect(container.innerHTML).toContain("&lt;div&gt;markup&lt;/div&gt;") // escaped text, not an element
   })
+})
+
+group("highlight and underline spans (PyMuPDF4LLM <mark>/<u>) show their text only", () => {
+  it.each([
+    ["- <mark>Track A (Free)</mark>", "• Track A (Free)"],
+    ["- <mark>AI Basics: https://www.youtube.com/watch?v=VGFpV3Qj4as</mark>", "• AI Basics: https://www.youtube.com/watch?v=VGFpV3Qj4as"],
+    ["on YouTube (first 16 videos) <mark>- https://bit.ly/3X6CCC7</mark>", "on YouTube (first 16 videos) - https://bit.ly/3X6CCC7"],
+    ["Link: <u>https://youtu.be/zwUSZD3t_BU</u>", "Link: https://youtu.be/zwUSZD3t_BU"],
+    ["<u><mark>both</mark></u> and <MARK>case</MARK>", "both and case"],
+    ["<mark>`☐` Track A: Finish all these exercises</mark>", "☐ Track A: Finish all these exercises"],
+  ])("%s", (input, visible) => {
+    const { container } = render(<Passage text={input} />)
+    expect(container).toHaveTextContent(visible, { normalizeWhitespace: true })
+    expect(container.textContent).not.toMatch(/<\/?(mark|u)>/i)
+    expect(container.querySelector("mark, u, a")).toBeNull()
+    expect(passagePreview(input)).toBe(visible)
+  })
+
+  it("keeps a superscript that follows a highlighted span", () => {
+    const { container } = render(<Passage text="<mark>(17</mark><sup>th</sup> <mark>to 27</mark><sup>th</sup> <mark>video)</mark>" />)
+    expect([...container.querySelectorAll("sup")].map((s) => s.textContent)).toEqual(["th", "th"])
+    expect(container).toHaveTextContent("(17th to 27th video)")
+  })
+
+  it("unwraps highlighted table cells", () => {
+    render(<Passage contentType="table" text={"|Track|Link|\n|---|---|\n|<mark>A</mark>|<u>https://bit.ly/x</u>|"} />)
+    expect(within(screen.getByRole("table")).getByText("A")).toBeInTheDocument()
+    expect(within(screen.getByRole("table")).getByText("https://bit.ly/x")).toBeInTheDocument()
+  })
+
+  it.each(["<mark>", "a <mark>open only", "<mark>x <b>y</b></mark>", "<u>line one\nline two</u>"])(
+    "leaves %s as literal text (not the extraction shape)",
+    (text) => {
+      const { container } = render(<Passage text={text} />)
+      expect(container.textContent).toMatch(/<(mark|u)>/)
+      expect(container.querySelector("mark, u, b")).toBeNull()
+    },
+  )
 })
 
 group("malformed tables: valid structure becomes a table, anything else stays readable", () => {
