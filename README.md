@@ -17,6 +17,7 @@ Live demo: [tarun.runs-on.dev](https://tarun.runs-on.dev) · Code: [github.com/t
 ### High level design
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 28, "padding": 8, "diagramPadding": 4}}}%%
 flowchart LR
     U["Browser"] --> N
     subgraph VM["Oracle Cloud VM"]
@@ -32,6 +33,7 @@ Next.js renders the UI and forwards five allowlisted endpoints to FastAPI, where
 ### Low level design
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 28, "padding": 8, "diagramPadding": 4}}}%%
 flowchart TB
     subgraph ING["Ingestion: ingest"]
         direction LR
@@ -69,6 +71,7 @@ Each box is a plain Python module in `rag/`, with no LangChain or agent framewor
 ### Workflows
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 28, "padding": 8, "diagramPadding": 4}}}%%
 flowchart TB
     subgraph Q["Ask a question"]
         direction TB
