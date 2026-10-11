@@ -1,9 +1,12 @@
 name: CI
 
 on:
+  # A change to README.md alone runs neither CI nor, since CD follows CI, a deployment.
   pull_request:
+    paths-ignore: [README.md]
   push:
     branches: [main]
+    paths-ignore: [README.md]
 
 permissions:
   contents: read
