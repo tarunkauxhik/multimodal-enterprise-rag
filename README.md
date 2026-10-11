@@ -12,98 +12,77 @@ Live demo: [tarun.runs-on.dev](https://tarun.runs-on.dev) · Code: [github.com/t
 - Resolves follow-ups like "tell me more" or "what about page 4?" from the last 3 exchanges.
 - Abstains when the documents don't cover a question, and refuses general-knowledge questions.
 
-## High level design
+## Architecture
+
+### High level design
 
 ```mermaid
-flowchart TB
-    U["Browser"] --> N["Nginx<br/>public HTTPS"] --> W["Next.js<br/>UI, /api proxy"] --> A["FastAPI<br/>api.py"]
-
-    subgraph ING["Ingestion: one background worker"]
-        direction TB
-        I1["Extract text,<br/>vision for hard pages"] --> I2["Chunk"] --> I3["Embed"]
+flowchart LR
+    U["Browser"] --> N
+    subgraph VM["Oracle Cloud VM"]
+        N["Nginx<br/>:443"] --> W["Next.js<br/>:3000"] --> A["FastAPI<br/>:8000"]
+        A --> Q[("Qdrant<br/>:6333")]
+        A --> C[("SQLite<br/>caches")]
     end
-
-    subgraph QA["Question answering"]
-        direction TB
-        Q1["Rewrite follow-up"] --> Q2["Route"] --> Q3["Hybrid retrieval,<br/>rerank"] --> Q4["Answer,<br/>check citations"]
-    end
-
-    A -->|"upload"| I1
-    A -->|"chat"| Q1
-
-    subgraph STORE["Storage"]
-        DB[("Qdrant<br/>vectors, payloads")]
-        C[("SQLite caches<br/>page results, embeddings")]
-    end
-
-    subgraph EXT["External model APIs"]
-        X["xAI Grok 4.7"]
-        G["Gemini Embedding 2"]
-        J["Jina Reranker v3"]
-    end
-
-    ING -->|"write"| STORE
-    QA <-->|"search"| STORE
-    STORE ~~~ EXT
-    ING -.-> EXT
-    QA -.-> EXT
+    A -.-> X["External APIs<br/>Grok · Gemini · Jina"]
 ```
 
-Next.js renders the UI and forwards five allowlisted endpoints to FastAPI. All RAG logic lives in `rag/`, one plain Python module per stage, with no LangChain. Grok reads hard pages, rewrites follow-ups and writes answers. Gemini embeds, Jina reranks.
+Next.js renders the UI and forwards five allowlisted endpoints to FastAPI, where all RAG logic lives. Grok reads hard pages, rewrites follow-ups and writes answers; Gemini embeds; Jina reranks.
 
-## Low level design
+### Low level design
 
 ```mermaid
 flowchart TB
-    P["PDF<br/>document_id = sha256(bytes)[:16]"] --> X["PyMuPDF4LLM<br/>Markdown per page, typed blocks"]
-    X --> R{"Hard page?"}
-    R -->|"no: most pages"| C
-    R -->|"yes"| V["Render at 150 DPI<br/>Grok 4.7 reads the image"]
-    V <-->|"cache"| UC[("understanding.sqlite")]
-    V -->|"merged as document content<br/>a failure keeps the fast text"| C["Chunks: one page each,<br/>section path, tables and figures whole"]
-    C --> E["Gemini Embedding 2<br/>768 dims"]
-    E <-->|"cache"| EC[("embeddings.sqlite")]
-    E --> S["Qdrant upsert, tagged write_id and chunk_total,<br/>then delete the document's stale points"]
+    subgraph ING["Upload: api.py → session.py → ingest.py"]
+        direction LR
+        EX["extract"] --> UN["understand"] --> CH["chunk"] --> EM["embed"] --> ST["store"]
+    end
+    subgraph QA["Chat: api.py → session.respond"]
+        direction LR
+        CX["contextualize"] --> RT["route"] --> RE["retrieve<br/>bm25, rerank"] --> GE["generate"]
+    end
+    ING ~~~ QA
 ```
 
+Each box is one plain Python module in `rag/`, with no LangChain or agent framework.
+
+### Workflows
+
 ```mermaid
 flowchart TB
-    M["Message and last 3 exchanges"] --> S{"Small talk?"}
-    S -->|"yes"| SR["Short reply, no model call"]
-    S -->|"no"| H{"Earlier turns?"}
-    H -->|"no"| RT
-    H -->|"yes"| CX["Grok rewrites it as a standalone request<br/>one attempt, 15 s timeout,<br/>falls back to the message as typed"]
-    CX --> RT{"Deterministic router"}
-    RT -->|"page N"| PG["That page's chunks"]
-    RT -->|"overview"| OV["The document's opening chunks"]
-    RT -->|"metadata or vague"| MD["Reply from payloads,<br/>or ask what they mean"]
-    RT -->|"question"| DN
-    RT -->|"question"| BM
-    subgraph HY["Hybrid retrieval, limited to one document when it is named"]
-        DN["Dense: Qdrant top 20"] --> F["RRF k=60, top 10"]
-        BM["BM25: in-memory top 20"] --> F
-        F --> J["Jina rerank, top 5"]
+    subgraph QN["Question answering"]
+        direction TB
+        Q1["Question +<br/>last 3 exchanges"] --> Q2["Grok rewrite<br/>follow-ups only"]
+        Q2 --> Q3["Route: page, overview,<br/>metadata or search"]
+        Q3 --> Q4["Dense top 20<br/>+ BM25 top 20"]
+        Q4 --> Q5["RRF k=60<br/>top 10"]
+        Q5 --> Q6["Jina rerank<br/>top 5"]
+        Q6 --> Q7["Grok answer<br/>typed question + rewrite"]
+        Q7 --> Q8["Citation check:<br/>answer or abstain"]
     end
-    PG --> G
-    OV --> G
-    J --> G["Grok 4.7 answers from delimited sources<br/>question = typed message + its rewrite"]
-    G -->|"OUT_OF_SCOPE"| OS["Scope refusal"]
-    G --> V{"At least one valid citation?"}
-    V -->|"yes"| A["Answer with numbered sources"]
-    V -->|"no, or INSUFFICIENT_CONTEXT"| AB["Abstain"]
+    subgraph IN["Document ingestion"]
+        direction TB
+        I1["PDF upload"] --> I2["PyMuPDF4LLM<br/>extract every page"]
+        I2 --> I3["Grok vision<br/>hard pages only"]
+        I3 --> I4["Structure-aware<br/>chunks"]
+        I4 --> I5["Gemini embeddings<br/>768 dims"]
+        I5 --> I6[("Qdrant upsert,<br/>stale points removed")]
+        I3 -.- C1[("page cache")]
+        I5 -.- C2[("embedding cache")]
+    end
 ```
 
 ## How it works
 
 **Selective ingestion.** PyMuPDF4LLM extracts every page. Grok sees a page only when the fast text is likely incomplete: a scan (under 50 characters and a large image), garbled text (≥ 1% U+FFFD), mostly a legacy Hindi font such as Kruti Dev, a large figure that isn't an event photo, or a table with half its cells empty. Its output is stored as document content, never as an answer.
 
-**Hybrid retrieval.** Dense search covers paraphrase and cross-language questions. BM25 catches exact names and numbers, and its tokenizer keeps Devanagari words whole. Their scores aren't comparable, so ranks are fused with RRF (dense 20 + BM25 20, k=60, top 10). Jina reranks those to 5. BM25 is rebuilt from Qdrant payloads, so the two indexes can't drift. Page and overview questions skip search, since "page 72" has nothing to match.
+**Hybrid retrieval.** Dense search covers paraphrase and cross-language questions. BM25 catches exact names and numbers, and its tokenizer keeps Devanagari words whole. Their scores aren't comparable, so ranks are fused with RRF (dense 20 + BM25 20, k=60, top 10). Jina reranks those to 5. BM25 is rebuilt from Qdrant payloads, so the two indexes can't drift. Page and overview questions skip search, since "page 72" has nothing to match. A question that names a document searches only that document.
 
 **Follow-ups.** When a message has earlier turns, one short Grok call rewrites it into a standalone request ("and the next page?" becomes "What is on page 4 of SRS.pdf?"). Routing and retrieval use the rewrite. The generator gets the message as typed plus the rewrite, so the user's own instructions survive. Earlier answers never become evidence. First messages and small talk skip the call, and a new topic comes back unchanged.
 
 **Grounding.** Retrieved text goes into delimited, untrusted `<source>` blocks. Each `[document, Page N]` must match a supplied passage, and invalid ones are removed. With none left, the app abstains. `INSUFFICIENT_CONTEXT` and `OUT_OF_SCOPE` are separate refusals, and neither falls back to general knowledge.
 
-**Failure handling.** Grok and Jina calls retry 408, 429, 5xx and network errors with backoff; Gemini retries through its SDK. A reply cut off at the token limit raises an error instead of returning half an answer. A failed page-vision call keeps the fast text, and a failed rewrite keeps the typed message. Questions are capped at 2,000 characters and history at 3 turns. One ingestion runs and one waits; more get 429. All Grok calls run at low reasoning effort.
+**Failure handling.** Grok and Jina calls retry 408, 429, 5xx and network errors with backoff; Gemini retries through its SDK. A reply cut off at the token limit raises an error instead of returning half an answer. A failed page-vision call keeps the fast text, and a failed rewrite keeps the typed message. Questions are capped at 2,000 characters and history at 3 turns. One ingestion runs and one waits; more get 429. Every Qdrant write is tagged with a `write_id` and chunk count, so a write cut short by a crash is never retrieved. All Grok calls run at low reasoning effort.
 
 ## Sessions, documents and caches
 
@@ -117,12 +96,7 @@ Re-ingesting the same PDF reuses both caches, so even an interrupted run skips f
 
 ## Deployment
 
-Production runs on an Oracle Cloud VM:
-
-- **Public:** Nginx on port 443 (HTTPS, certbot certificate). Port 80 answers with a redirect to HTTPS.
-- **Internal, not reachable from the internet:** Next.js standalone on `127.0.0.1:3000`, FastAPI with one Uvicorn worker on `127.0.0.1:8000`, Qdrant in Docker on port 6333 (meant to be published as `127.0.0.1:6333`).
-- **Proxying:** Nginx proxies only to Next.js. Next.js reaches FastAPI server-side, and FastAPI reaches Qdrant.
-- **Services:** `rag-api` and `rag-web` are systemd units in [`deploy/`](deploy/). There is one worker because upload jobs are held in memory.
+Only Nginx is public: port 443 with a certbot certificate, and port 80 redirects to HTTPS. Next.js (`127.0.0.1:3000`), FastAPI (`127.0.0.1:8000`, one Uvicorn worker because upload jobs live in memory) and Qdrant in Docker (port 6333) are not reachable from the internet. The `rag-api` and `rag-web` systemd units and the Nginx site config are in [`deploy/`](deploy/).
 
 GitHub Actions CI runs on every pull request and push to `main`. The backend job runs `uv sync --frozen` and pytest. The frontend job runs `npm ci`, Vitest, ESLint, `tsc` and a production build.
 
