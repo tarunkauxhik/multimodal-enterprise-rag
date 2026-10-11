@@ -33,66 +33,104 @@ Next.js renders the UI and forwards five allowlisted endpoints to FastAPI, where
 
 ```mermaid
 flowchart TB
-    subgraph ING["Upload: api.py → session.py → ingest.py"]
+    subgraph ING["Ingestion: ingest"]
         direction LR
-        EX["extract"] --> UN["understand"] --> CH["chunk"] --> EM["embed"] --> ST["store"]
+        EX["extract<br/>PyMuPDF4LLM"] --> UN["understand<br/>Grok, hard pages"] --> CH["chunk<br/>page-bound"] --> EM["embed<br/>Gemini 768d"] --> ST[("store<br/>Qdrant")]
     end
-    subgraph QA["Chat: api.py → session.respond"]
-        direction LR
-        CX["contextualize"] --> RT["route"] --> RE["retrieve<br/>bm25, rerank"] --> GE["generate"]
+
+    subgraph ASK["Question answering: session.respond"]
+        direction TB
+        MSG["Message +<br/>last 3 exchanges"] --> CX["contextualize<br/>Grok rewrite, follow-ups only"]
+        CX --> RT{"route"}
+        RT -->|"small talk,<br/>metadata"| DIRECT["Direct reply,<br/>no retrieval"]
+        RT -->|"page, overview"| PICK["Chosen chunks"]
+        RT -->|"question"| DN
+        RT -->|"question"| BM
+        subgraph HYB["Hybrid retrieval: retrieve, scoped to a named document"]
+            direction LR
+            DN["Dense, Qdrant<br/>semantic similarity<br/>top 20"]
+            BM["BM25, in memory<br/>keyword matching<br/>top 20"]
+        end
+        DN --> RRF["RRF k=60<br/>top 10"]
+        BM --> RRF
+        RRF --> JR["Jina rerank<br/>top 5"]
+        JR --> GEN["generate, Grok<br/>typed question + rewrite"]
+        PICK --> GEN
+        GEN --> VAL{"valid<br/>citations?"}
+        VAL -->|"yes"| ANS["Answer +<br/>sources"]
+        VAL -->|"no"| ABS["Abstain"]
     end
-    ING ~~~ QA
+
+    ING ~~~ ASK
 ```
 
-Each box is one plain Python module in `rag/`, with no LangChain or agent framework.
+Each box is a plain Python module in `rag/`, with no LangChain or agent framework.
 
 ### Workflows
 
 ```mermaid
 flowchart TB
-    subgraph QN["Question answering"]
+    subgraph Q["Ask a question"]
         direction TB
-        Q1["Question +<br/>last 3 exchanges"] --> Q2["Grok rewrite<br/>follow-ups only"]
-        Q2 --> Q3["Route: page, overview,<br/>metadata or search"]
-        Q3 --> Q4["Dense top 20<br/>+ BM25 top 20"]
-        Q4 --> Q5["RRF k=60<br/>top 10"]
-        Q5 --> Q6["Jina rerank<br/>top 5"]
-        Q6 --> Q7["Grok answer<br/>typed question + rewrite"]
-        Q7 --> Q8["Citation check:<br/>answer or abstain"]
+        Q1["Browser tab<br/>history in sessionStorage"] --> Q2["POST /api/chat<br/>question + last 3 exchanges"]
+        Q2 --> Q3["Next.js proxy<br/>forwards to FastAPI"]
+        Q3 --> Q4["Reply kind: answer, abstain,<br/>out of scope, clarify,<br/>workspace or conversation"]
+        Q4 --> Q5["Proxy strips internals,<br/>UI numbers citations"]
     end
-    subgraph IN["Document ingestion"]
+    subgraph UP["Upload a PDF"]
         direction TB
-        I1["PDF upload"] --> I2["PyMuPDF4LLM<br/>extract every page"]
-        I2 --> I3["Grok vision<br/>hard pages only"]
-        I3 --> I4["Structure-aware<br/>chunks"]
-        I4 --> I5["Gemini embeddings<br/>768 dims"]
-        I5 --> I6[("Qdrant upsert,<br/>stale points removed")]
-        I3 -.- C1[("page cache")]
-        I5 -.- C2[("embedding cache")]
+        U1["Documents page<br/>upload"] --> U2{"Same PDF already<br/>stored and complete?"}
+        U2 -->|"yes"| U3["Ready,<br/>nothing re-processed"]
+        U2 -->|"no"| U4["Queued<br/>one runs, one waits,<br/>more get 429"]
+        U4 --> U5["Background worker<br/>runs the ingestion stages"]
+        U5 --> U6["Status: ready, incomplete,<br/>empty or failed<br/>UI polls every 2 s"]
     end
 ```
 
+The workflows show the same two paths from the user's side: upload statuses, the chat request and the reply kinds.
+
 ## How it works
 
-**Selective ingestion.** PyMuPDF4LLM extracts every page. Grok sees a page only when the fast text is likely incomplete: a scan (under 50 characters and a large image), garbled text (≥ 1% U+FFFD), mostly a legacy Hindi font such as Kruti Dev, a large figure that isn't an event photo, or a table with half its cells empty. Its output is stored as document content, never as an answer.
+### Document ingestion
 
-**Hybrid retrieval.** Dense search covers paraphrase and cross-language questions. BM25 catches exact names and numbers, and its tokenizer keeps Devanagari words whole. Their scores aren't comparable, so ranks are fused with RRF (dense 20 + BM25 20, k=60, top 10). Jina reranks those to 5. BM25 is rebuilt from Qdrant payloads, so the two indexes can't drift. Page and overview questions skip search, since "page 72" has nothing to match. A question that names a document searches only that document.
+- **PDF extraction.** PyMuPDF4LLM turns every page into typed blocks: headings, text, tables, figures and captions.
+- **Selective multimodal processing.** Grok reads a page image only when the fast text is likely incomplete:
+  - a scan (under 50 characters and a large image);
+  - garbled text (≥ 1% U+FFFD);
+  - mostly a legacy Hindi font such as Kruti Dev;
+  - a large figure that isn't an event photo;
+  - a table with half its cells empty.
 
-**Follow-ups.** When a message has earlier turns, one short Grok call rewrites it into a standalone request ("and the next page?" becomes "What is on page 4 of SRS.pdf?"). Routing and retrieval use the rewrite. The generator gets the message as typed plus the rewrite, so the user's own instructions survive. Earlier answers never become evidence. First messages and small talk skip the call, and a new topic comes back unchanged.
+  Its output becomes document content, never an answer. A failed call keeps the fast text.
+- **Chunking, embeddings and storage.** A chunk never spans pages and keeps its section path. Tables and figures stay whole, and prose is packed up to 1,500 characters. Chunks are embedded with Gemini and upserted to Qdrant (cosine), and re-ingesting deletes the document's stale points.
 
-**Grounding.** Retrieved text goes into delimited, untrusted `<source>` blocks. Each `[document, Page N]` must match a supplied passage, and invalid ones are removed. With none left, the app abstains. `INSUFFICIENT_CONTEXT` and `OUT_OF_SCOPE` are separate refusals, and neither falls back to general knowledge.
+### Question answering
 
-**Failure handling.** Grok and Jina calls retry 408, 429, 5xx and network errors with backoff; Gemini retries through its SDK. A reply cut off at the token limit raises an error instead of returning half an answer. A failed page-vision call keeps the fast text, and a failed rewrite keeps the typed message. Questions are capped at 2,000 characters and history at 3 turns. One ingestion runs and one waits; more get 429. Every Qdrant write is tagged with a `write_id` and chunk count, so a write cut short by a crash is never retrieved. All Grok calls run at low reasoning effort.
+- **Conversation contextualization.** With earlier turns, one short Grok call rewrites the message into a standalone request ("and the next page?" becomes "What is on page 4 of SRS.pdf?"). First messages and small talk skip it, and a new topic comes back unchanged.
+- **Routing and document scoping.** A deterministic router answers small talk and metadata questions directly. Page and overview questions get their chunks without search, since "page 72" has nothing to match. A question that names a document searches only that document.
+- **Hybrid retrieval.** Dense search covers paraphrase and cross-language questions. BM25 catches exact names and numbers, and its tokenizer keeps Devanagari words whole. BM25 is rebuilt from Qdrant payloads, so the two indexes can't drift.
+- **RRF and reranking.** The scores aren't comparable, so ranks are fused with RRF. Jina then keeps the best 5 for the answer.
+- **Grounded generation.** Sources go into delimited, untrusted `<source>` blocks. The generator answers the message as typed, with the rewrite attached, so the user's own instructions survive. Earlier answers never become evidence.
+- **Citation validation.** Each `[document, Page N]` must match a supplied passage, and invalid citations are removed. With none left, the app abstains. `INSUFFICIENT_CONTEXT` (not enough evidence) and `OUT_OF_SCOPE` (not about the documents) are separate refusals, and neither falls back to general knowledge.
 
-## Sessions, documents and caches
+### Caching and reliability
 
-- **Chat history** lives in the browser tab's sessionStorage. It survives a reload and is gone when the tab closes. The server stores no conversations: each request carries its last 3 exchanges, answers cut to 1,500 characters. Separate tabs don't share history. This is not user identity or access control.
-- **Documents** live in one shared Qdrant collection (`documents`). There are no accounts, so anyone who can reach the site can list, query and delete every document.
-- **Deletion** removes all of the document's Qdrant points, and with them its listing and retrieval. The uploaded PDF is never written to disk. The SQLite caches are not touched, so the document's cached page results (extracted text) and embedding vectors stay on disk.
-- **`embeddings.sqlite`** is keyed by sha256(model, dimensions, task, text) and stores the vector. Document chunks and questions are cached alike, and any repeated text is never re-embedded.
+- **`embeddings.sqlite`** is keyed by sha256(model, dimensions, task, text) and stores the vector. Chunks and questions are cached alike, so repeated text is never re-embedded.
 - **`understanding.sqlite`** is keyed by sha256(provider/model, prompt version, DPI, document, page, task) and stores Grok's JSON result. Only successes are cached.
+- **Reuse.** Re-ingesting a PDF reuses both caches, so even an interrupted run skips finished work. A new model or prompt version changes the key and forces a recompute. Neither cache expires or has a cleanup command.
+- **Write completeness.** Every Qdrant write is tagged with a `write_id` and chunk count, so a write cut short by a crash is never retrieved.
+- **Failure handling.**
+  - Grok and Jina calls retry 408, 429, 5xx and network errors with backoff, and Gemini retries through its SDK.
+  - A reply cut off at the token limit raises an error instead of returning half an answer.
+  - A failed rewrite (one attempt, 15 s timeout) keeps the typed message.
+  - Questions are capped at 2,000 characters and history at 3 turns.
+  - All Grok calls run at low reasoning effort.
 
-Re-ingesting the same PDF reuses both caches, so even an interrupted run skips finished work. A new model or prompt version changes the key and forces a recompute. Neither cache expires or has a cleanup command.
+## Sessions, documents and deletion
+
+- **Chat history** lives in the browser tab's sessionStorage. It survives a reload and is gone when the tab closes. The server stores no conversations; each request carries its last 3 exchanges, with answers cut to 1,500 characters. Separate tabs don't share history. This is not user identity or access control.
+- **Documents** live in one shared Qdrant collection (`documents`). There are no accounts, so anyone who can reach the site can list, query and delete every document. A duplicate file name gets a " (2)" suffix so citations stay unambiguous.
+- **Deletion** removes all of the document's Qdrant points, and with them its listing and retrieval. The uploaded PDF is never written to disk. The SQLite caches are not touched, so the document's cached page results (extracted text) and embedding vectors stay on disk.
 
 ## Deployment
 
