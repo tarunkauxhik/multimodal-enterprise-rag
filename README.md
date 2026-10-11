@@ -1,238 +1,236 @@
 # Multimodal Enterprise RAG
 
-Question answering over enterprise PDFs. Upload English or Hindi reports, ask in English, Hindi or Hinglish, and get answers grounded only in those documents, with validated `[document.pdf, Page N]` citations.
+A deployed document question-answering app. You upload PDFs, ask questions, and get answers that come only from those documents, with page citations. Follow-up questions use the recent conversation, and each answer shows the passages behind it. It handles English and Hindi PDFs, and questions in English, Hindi or Hinglish.
 
-**Live:** [tarun.runs-on.dev](https://tarun.runs-on.dev)  
-**Stack:** Next.js · FastAPI · Python 3.12 · Qdrant · PyMuPDF4LLM · xAI Grok 4.7 · Gemini Embedding 2 · rank-bm25 · Jina Reranker v3
+Live demo: [tarun.runs-on.dev](https://tarun.runs-on.dev) · Code: [github.com/tarunkauxhik/multimodal-enterprise-rag](https://github.com/tarunkauxhik/multimodal-enterprise-rag)
 
-## How it works
+## What it does
+
+- Upload PDFs up to 200 MB. Processing runs in the background and the UI shows each stage.
+- Read hard pages (scans, broken fonts, charts, sparse tables) with a vision model. Other pages keep fast text extraction.
+- Retrieve with dense search and BM25 together, fuse the rankings, then rerank.
+- Cite sources as `[document, Page N]`. Citations are checked against the passages the model actually saw.
+- Resolve follow-ups like "tell me more" or "what about page 4?" from the last 3 exchanges.
+- Say so when the documents don't cover a question, and refuse general-knowledge questions.
+
+## High level design
 
 ```mermaid
-flowchart LR
-    subgraph Ingest
-        P[PDF] --> X[PyMuPDF4LLM<br/>fast extraction]
-        X --> R{Hard page?}
-        R -- no --> C[Structure-aware<br/>chunking]
-        R -- yes --> M[Grok 4.7<br/>page vision] --> C
-        C --> E[Gemini Embedding 2<br/>768d]
-        E --> Q[(Qdrant)]
+flowchart TB
+    U["Browser"] --> N["Nginx<br/>HTTPS, basic auth"] --> W["Next.js<br/>UI, /api proxy"] --> A["FastAPI<br/>api.py"]
+
+    subgraph ING["Ingestion: one background worker"]
+        direction TB
+        I1["Extract text,<br/>vision for hard pages"] --> I2["Chunk"] --> I3["Embed"]
     end
 
-    subgraph Query
-        U[Question] --> D[Dense top 20]
-        U --> B[BM25 top 20]
-        D --> F[RRF k=60<br/>top 10]
-        B --> F
-        F --> J[Jina rerank<br/>top 5]
-        J --> G[Grok 4.7<br/>grounded answer]
-        G --> V[Citation check]
-        V --> A[Answer + citations<br/>or abstain]
+    subgraph QA["Question answering"]
+        direction TB
+        Q1["Rewrite follow-up"] --> Q2["Route"] --> Q3["Hybrid retrieval,<br/>rerank"] --> Q4["Answer,<br/>check citations"]
     end
 
-    Q --> D
-    Q -. chunk payloads .-> B
+    A -->|"upload"| I1
+    A -->|"chat"| Q1
+
+    subgraph STORE["Storage"]
+        DB[("Qdrant<br/>vectors, payloads")]
+        C[("SQLite caches<br/>page results, embeddings")]
+    end
+
+    subgraph EXT["External model APIs"]
+        X["xAI Grok 4.7"]
+        G["Gemini Embedding 2"]
+        J["Jina Reranker v3"]
+    end
+
+    ING -->|"write"| STORE
+    QA <-->|"search"| STORE
+    STORE ~~~ EXT
+    ING -.-> EXT
+    QA -.-> EXT
 ```
 
-1. **Extract** every page quickly with PyMuPDF4LLM into typed blocks (heading, text, table, figure, caption).
-2. **Route** only hard pages to Grok 4.7 vision; everything else keeps the fast extraction.
-3. **Chunk** by structure: chunks never cross pages, keep their section path, and tables and figures stay whole.
-4. **Embed** with Gemini Embedding 2 (768d, cached in SQLite) and store in Qdrant (cosine).
-5. **Retrieve** with dense search plus BM25, fuse by rank with RRF, rerank with Jina.
-6. **Answer** with Grok 4.7 from the top 5 chunks, then validate every citation.
+Next.js only renders the UI and forwards five allowlisted endpoints to FastAPI. All RAG logic lives in `rag/`, one module per stage. Grok handles page vision, the follow-up rewrite and answers. Gemini embeds documents and queries, and Jina reranks. Ingestion progress is kept in memory, and SQLite only caches model results.
 
-## Selective multimodal understanding
+## Low level design
 
-Sending every page to a vision model is slow: a 9-page batch took about 30 s with MiniMax-M3, the model the pipeline was benchmarked with. So a page goes to the vision model only when a deterministic check says fast extraction may have lost something:
+### Ingestion
 
-| Signal | Rule | Model output stored as |
+```mermaid
+flowchart TB
+    P["PDF<br/>document_id = sha256(bytes)[:16]"] --> X["PyMuPDF4LLM<br/>Markdown per page, then typed blocks"]
+    X --> R{"Hard page?<br/>rules in the table below"}
+    R -->|"no: most pages"| C
+    R -->|"yes"| V["Render at 150 DPI<br/>Grok 4.7 reads the page image"]
+    V <-->|"cached by provider, model, prompt version"| UC[("understanding.sqlite")]
+    V -->|"merged as document content<br/>a failure keeps the fast text"| C["Structure-aware chunks<br/>one page each, section path,<br/>tables and figures kept whole"]
+    C --> E["Gemini Embedding 2<br/>768 dims, RETRIEVAL_DOCUMENT"]
+    E <-->|"only new texts are embedded"| EC[("embeddings.sqlite")]
+    E --> S["Qdrant upsert<br/>point id = uuid5(chunk_id)<br/>tagged write_id, chunk_total"]
+    S --> D["Delete the document's stale points"]
+```
+
+### Question answering
+
+```mermaid
+flowchart TB
+    M["Message and last 3 exchanges"] --> S{"Small talk?"}
+    S -->|"yes"| SR["Short reply, no model call"]
+    S -->|"no"| H{"Earlier turns?"}
+    H -->|"no"| RT
+    H -->|"yes"| CX["Grok rewrites it as a standalone request<br/>one attempt, 15 s timeout,<br/>falls back to the message as typed"]
+    CX --> RT{"Deterministic router"}
+    RT -->|"page N"| PG["That page's chunks"]
+    RT -->|"overview"| OV["The document's opening chunks"]
+    RT -->|"metadata or vague"| MD["Reply from payloads,<br/>or ask what they mean"]
+    RT -->|"question"| DN
+    RT -->|"question"| BM
+    subgraph HY["Hybrid retrieval, limited to one document when it is named"]
+        DN["Dense: Qdrant top 20"] --> F["RRF k=60, top 10"]
+        BM["BM25: in-memory top 20"] --> F
+        F --> J["Jina rerank, top 5"]
+    end
+    PG --> G
+    OV --> G
+    J --> G["Grok 4.7 answers from delimited sources<br/>question = typed message + its rewrite"]
+    G -->|"OUT_OF_SCOPE"| OS["Scope refusal"]
+    G --> V{"At least one valid citation?"}
+    V -->|"yes"| A["Answer with numbered sources"]
+    V -->|"no, or INSUFFICIENT_CONTEXT"| AB["Abstain"]
+```
+
+## Engineering decisions
+
+### Selective multimodal ingestion
+
+Sending every page to a vision model is slow and costly. So PyMuPDF4LLM extracts every page first, and a deterministic check sends a page to Grok only when the fast text is likely incomplete.
+
+| Signal | Rule | Grok output stored as |
 |---|---|---|
-| Scanned | < 50 non-space characters and an image covering ~40% of the page | `figure` blocks |
-| Garbled | ≥ 1% U+FFFD replacement characters | re-transcribed `text` |
-| Legacy Hindi font | ≥ 50% of the page's Latin letters in a known pre-Unicode Hindi font (Kruti Dev, Arjun, …); fallback: Latin text with < 32% vowels and ≥ 20% words with in-word punctuation (`m\|ksx`) | re-transcribed `text` |
-| Informational figure | large figure whose caption is not an event photo ("Glimpses…", "Hon'ble…", "…held at…") | figure content |
-| Broken table | ≥ 50% of data cells empty | `table` |
+| Scanned | < 50 non-space characters and an image over ~40% of the page | `figure` blocks |
+| Garbled | ≥ 1% U+FFFD replacement characters | re-transcribed text |
+| Legacy Hindi font | ≥ 50% of Latin letters in a known pre-Unicode font (Kruti Dev, Arjun), or a matching text fingerprint | re-transcribed text |
+| Informative figure | large figure whose caption is not an event photo ("Glimpses…", "Hon'ble…") | figure description |
+| Sparse table | ≥ 50% of data cells empty | re-extracted table |
 
-Pages are rendered at 150 DPI as PNG. The model's output is stored as **document content, never as an answer**, then chunked and embedded like any other block. If the call fails, the fast extraction is kept. Results are cached in `data/cache/understanding.sqlite`, keyed by provider and model (`xai/grok-4.7`), so results from an earlier model are never reused; re-ingesting a document asks Grok again.
+Grok's output is stored as document content, never as an answer. It is chunked and embedded like any other text. Results are cached by provider and model, so a model change never reuses old page results.
 
-## Retrieval and grounding
+### Hybrid retrieval
 
-- **Hybrid search.** Dense retrieval handles paraphrase and cross-language queries; BM25 catches exact names, numbers and terms. Its tokenizer is Unicode-aware, so Devanagari words stay whole.
-- **One source of truth.** The BM25 index is rebuilt in memory from the chunks stored in Qdrant, so the two indexes cannot drift.
-- **RRF over ranks.** Dense and BM25 scores are not comparable, so they are fused by rank (k=60).
-- **Untrusted context.** Retrieved text is sent inside delimited `<source>` blocks, with the rules restated after it, so instructions hidden in a PDF are ignored.
-- **Citation validation.** Each `[document, Page N]` must match a retrieved chunk. A bare `[Page N]` is accepted only if exactly one document has that page. Invalid citations are removed; if none remain, the system answers `INSUFFICIENT_CONTEXT`.
-- **Follow-ups.** The browser sends the last 3 exchanges with each question. When there are earlier turns, one short model call rewrites the message into a standalone request ("tell me more" → "What are the functional requirements in SRS.pdf?", "and the next page?" → "What is on page 4 of SRS.pdf?"), which then goes through the same routing, retrieval and citation checks as a first message; the answer step sees the message as typed plus that reading. First messages skip it. Earlier answers only shape the request; they are never evidence.
-- **Low reasoning effort.** Grok 4.7 always reasons and cannot switch it off; it returns the reasoning in a separate `reasoning_content` field that the app never reads, so the answer text is not cut. Answers and page understanding run with `reasoning_effort="low"` (grounded extraction from supplied text or one page image needs little deliberation; lower latency and cost). Any `<think>` block in the reply text is still stripped as a safeguard.
+Dense search handles paraphrase and cross-language questions. BM25 catches exact names, numbers and codes, and its tokenizer keeps Devanagari words whole. Their scores aren't comparable, so the app fuses ranks with Reciprocal Rank Fusion: dense top 20 and BM25 top 20, k=60, top 10. Jina then reranks those 10 against the question and keeps 5 for the answer.
 
-## Design choices
+The BM25 index is rebuilt in memory from the chunk payloads in Qdrant. There is one source of truth, so the two indexes can't drift. Page and overview questions skip semantic search entirely, because "what is on page 72?" has nothing to match.
 
-| Component | Chosen | Tried | Why |
+### Conversational RAG
+
+The browser keeps the chat and sends the last 3 answered exchanges with each question. When a message has earlier turns, one short Grok call rewrites it into a standalone request. "And the next page?" becomes "What is on page 4 of SRS.pdf?". The existing router and retrieval then treat it like a first message.
+
+Three things stay separate:
+
+- The rewrite drives routing and retrieval.
+- The generator answers the message as typed, with the rewrite attached as its reading. A formatting or language instruction in the original survives.
+- Evidence comes only from retrieved chunks. Earlier answers shape the request but never reach the generator as sources.
+
+First messages and small talk skip the rewrite, since there is nothing to resolve. A question that names a document, directly or through the rewrite, only retrieves from that document. A new, unrelated question comes back from the rewrite unchanged.
+
+### Other choices
+
+| Area | Chosen | Tried | Why |
 |---|---|---|---|
-| PDF extraction | PyMuPDF4LLM (~6.6 s) | Docling (56–185 s) | Docling was accurate but too slow for a prototype |
-| Vision + answers | xAI Grok 4.7 | MiniMax-M3, MiniMax-M2.7 | M3 was the benchmarked choice (M2.7 failed the tested charts and images); its gateway is unavailable, so Grok 4.7 replaces it. Grok is not yet benchmarked in this pipeline |
-| Embeddings | Gemini Embedding 2 (19 chunks ~1.7 s) | BGE-M3, BGE-small/base, Qwen3-Embedding-0.6B | Local models too slow or English-focused |
-| Reranker | Jina Reranker v3 (19 pairs ~1.45 s) | BGE reranker v2-m3, Voyage | Too slow locally / rate limits |
-| Frontend | Next.js + shadcn/ui, a client of the API | Streamlit (V1 prototype) | A production UI needs real routing, accessibility, responsive layout and source presentation; all RAG logic stays behind FastAPI |
-| Orchestration | Plain Python modules | — | No LangChain or LangGraph; the pipeline is linear and easy to debug. FastAPI is only a thin HTTP adapter (`api.py`) |
+| PDF extraction | PyMuPDF4LLM | Docling | Docling was accurate but too slow for this use |
+| Vision and answers | xAI Grok 4.7 | MiniMax-M3 | M3 was the benchmarked model; its gateway is unavailable, so Grok replaced it |
+| Embeddings | Gemini Embedding 2 | BGE-M3, Qwen3-Embedding | Local models were slow or English-focused |
+| Orchestration | Plain Python modules | (none) | No LangChain or LangGraph: the pipeline is linear and easy to debug |
 
-Other decisions:
+Grok always reasons and can't switch it off. It returns that reasoning in a separate field the app never reads. All three Grok roles run at `reasoning_effort="low"`. Reading a page, rewriting a question and answering from five passages don't need deep reasoning, and low effort is faster and cheaper.
 
-- **Idempotent ingestion.** `document_id` is the first 16 hex characters of the PDF's SHA-256, and chunk and point IDs derive from it. Re-ingesting upserts, then deletes stale chunks. Cached embeddings are never recomputed, so an interrupted ingestion resumes cheaply.
-- **One shared workspace.** The web app and the HTTP API use one Qdrant collection (`documents` by default), the same one the CLI writes to.
+## Guardrails and failure handling
 
-## Architecture
+- Retrieved text goes into delimited, untrusted `<source>` blocks, and the rules are restated after them. Instructions hidden in a PDF are treated as content.
+- Each `[document, Page N]` must match a passage that was supplied. Invalid citations are removed. If none remain, the app abstains.
+- There are two refusals: not enough evidence (`INSUFFICIENT_CONTEXT`) and not about the documents (`OUT_OF_SCOPE`). Neither falls back to general knowledge.
+- A failed or slow rewrite (one attempt, 15 s timeout) falls back to the message as typed. Grounding is unchanged.
+- Model calls retry 408, 429, 5xx and network errors with backoff. A reply cut off at the token limit raises an error instead of returning half an answer. API keys are redacted from errors.
+- Inputs are bounded. Questions are capped at 2,000 characters and history at 3 turns. Uploads are capped at 200 MB, with one ingestion running and one queued; further uploads get 429.
+- Every Qdrant write carries a `write_id` and `chunk_total`. A partial or interrupted write is never retrieved, and it shows as incomplete until the file is uploaded again.
+- A failed page-vision call keeps the fast extraction for that page.
+- The UI renders document text as plain text and answers without HTML. The proxy drops internal ids and server error details from every reply.
 
-```text
-Browser
-  -> Next.js web app (web/)             UI only; its server forwards /api/* to FastAPI
-    -> FastAPI (api.py) 127.0.0.1:8000  the application boundary
-      -> rag/ pipeline                  extraction, vision, chunking, embeddings, retrieval, answers
-        -> Qdrant 127.0.0.1:6333 · xAI, Gemini and Jina APIs
-```
+## Performance
 
-The frontend holds no RAG logic and knows nothing about Qdrant, embeddings, BM25, fusion or reranking. The browser only calls same-origin `/api/*`. A Next.js route handler ([`web/app/api/[...path]/route.ts`](web/app/api/[...path]/route.ts)) forwards exactly the five endpoints below to FastAPI at `RAG_API_URL` and nothing else. It streams request bodies (a 200 MB upload is never held in memory), forwards no cookies or credentials, and reduces every reply to the fields the UI uses, so chunk ids, point counts, exception names and database details never reach the browser. FastAPI itself stays on localhost.
+No latency benchmark is published, and response time depends mostly on the external model APIs. The design avoids work where it can. The vision model sees only flagged pages. SQLite caches embeddings (documents and queries) and page results, so re-running an ingestion, even an interrupted one, skips work already done. BM25 runs in memory next to the API. The rewrite runs only on follow-ups, history is capped, and Grok runs at low reasoning effort.
 
-## Project structure
+## Tech stack
 
-```text
-api.py              HTTP API (FastAPI adapter, single shared workspace)
-rag/
-  config.py         models, constants, settings from env
-  extract.py        PDF -> typed page blocks
-  understand.py     page routing + Grok 4.7 vision
-  chunk.py          structure-aware chunks with metadata
-  embed.py          Gemini embeddings + SQLite cache
-  store.py          Qdrant collection and upserts
-  bm25.py           Unicode-aware BM25
-  retrieve.py       dense + BM25 -> RRF -> rerank
-  rerank.py         Jina client
-  contextualize.py  follow-up rewriting from earlier turns (one short model call, only after the first message)
-  route.py          deterministic chat routing before retrieval (no model call)
-  generate.py       grounded prompt, citation validation, LLM client
-  ingest.py         ingestion pipeline + CLI
-  session.py        services, ingestion and answering for the API
-web/                Next.js + TypeScript + Tailwind + shadcn/ui frontend
-  app/              routes: / (chat), /documents, /api/[...path] (proxy to FastAPI)
-  components/       sidebar, chat, documents, sources, shadcn/ui primitives
-  hooks/, lib/      polling, conversations, typed API client, status and citation mapping
-  tests/            Vitest + Testing Library
-deploy/             systemd units and Nginx site for the VM
-tests/              offline pytest suite
-evals/              30-question gold set
-```
+| Area | Used |
+|---|---|
+| Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4, shadcn/ui, react-markdown |
+| Backend | Python 3.12, FastAPI, Uvicorn, httpx, uv |
+| Documents | PyMuPDF4LLM |
+| Models | xAI `grok-4.7` (page vision, follow-up rewrite, answers), Google `gemini-embedding-2` (768 dims) |
+| Retrieval | Qdrant (cosine), rank-bm25, Jina `jina-reranker-v3` |
+| State | SQLite caches, in-memory job state, chat history in the browser's sessionStorage |
+| Deployment | Oracle Cloud VM, Nginx, systemd, Qdrant in Docker, GitHub Actions |
 
 ## Run locally
 
-Requires [uv](https://docs.astral.sh/uv/), Node.js 24 LTS (≥ 24.15) or 22 (≥ 22.22.2) and Docker. Next.js 16 alone needs Node ≥ 20.9; the test toolchain (Vitest, jsdom) needs the versions above, which `web/package.json` `engines` records.
+You need [uv](https://docs.astral.sh/uv/) (it fetches Python 3.12 if missing), Node.js 22.22+ or 24.15+, Docker for Qdrant, and API keys for xAI, Gemini and Jina. The API won't start without the keys; the offline tests don't need them.
 
 ```bash
 uv sync
-docker run -d --name rag-qdrant -p 127.0.0.1:6333:6333 \
-  -v rag_qdrant_storage:/qdrant/storage qdrant/qdrant:latest
-cp .env.example .env          # fill in the API keys
-
-# terminal 1: the API
+docker run -d --name rag-qdrant -p 127.0.0.1:6333:6333 -v rag_qdrant_storage:/qdrant/storage qdrant/qdrant:latest
+cp .env.example .env        # Windows: copy .env.example .env, then add your keys
 uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
-
-# terminal 2: the web app
-cd web && npm ci && npm run dev -- --hostname 127.0.0.1   # http://127.0.0.1:3000
 ```
 
-Qdrant must be running before the API starts.
+In a second terminal:
 
-| Variable | Used by | Purpose |
+```bash
+cd web
+npm ci
+npm run dev -- --hostname 127.0.0.1    # http://127.0.0.1:3000
+```
+
+| Variable | Needed | Purpose |
 |---|---|---|
-| `XAI_API_KEY` | API (required) | Page understanding and answers (xAI Grok 4.7) |
-| `GEMINI_API_KEY` | API (required) | Embeddings |
-| `JINA_API_KEY` | API (required) | Reranking |
-| `XAI_BASE_URL` | API | xAI Chat Completions endpoint, default `https://api.x.ai/v1` |
-| `QDRANT_URL`, `QDRANT_API_KEY` | API | Default `http://127.0.0.1:6333`; key only if Qdrant requires one |
-| `API_COLLECTION` | API | Workspace collection, default `documents` |
-| `API_MAX_UPLOAD_MB` | API | Upload limit, default 200 |
-| `RAG_API_URL` | web server | Where the Next.js server reaches FastAPI, default `http://127.0.0.1:8000` |
+| `XAI_API_KEY`, `GEMINI_API_KEY`, `JINA_API_KEY` | yes | Grok, embeddings, reranking |
+| `XAI_BASE_URL` | no | Default `https://api.x.ai/v1` |
+| `QDRANT_URL`, `QDRANT_API_KEY` | no | Default `http://127.0.0.1:6333`; key only if Qdrant needs one |
+| `API_COLLECTION`, `API_MAX_UPLOAD_MB` | no | Workspace collection (`documents`), upload limit (200) |
+| `RAG_API_URL` | no | Where Next.js reaches FastAPI, default `http://127.0.0.1:8000` |
 
-Only the API reads keys, from the environment or a gitignored `.env`, and redacts them from errors. The web app holds no secrets.
+Only the API reads keys, from the environment or a gitignored `.env`. The web app holds no secrets.
 
-```bash
-uv run pytest                               # backend: offline suite; live tests are skipped
-cd web && npm test && npm run lint && npm run typecheck && npm run build   # frontend
-uv run python -m rag.ingest file.pdf ...    # CLI ingestion (shared collection)
-uv run python -m rag.retrieve "question"    # CLI retrieval
-RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s
-```
-
-The live test sends English, Hindi, Hinglish and cross-language queries through real Gemini, Qdrant and Jina. One Hinglish → Devanagari case is marked `xfail` because Jina demotes the correct chunk out of first place.
-
-## Web app
-
-- **Chat:** a document-style conversation. Enter sends, Shift+Enter adds a line. The start screen suggests questions about the ready documents by name; a new question scrolls to the top; the open conversation survives a reload. Every question is one `POST /api/chat`; earlier turns stay in the browser tab for display only and are never sent. Validated citations become numbered markers, sources are grouped by document page, and opening one shows the document, page, content type, section and passage text.
-- **Documents:** drag and drop or pick PDFs (up to 200 MB), see upload progress, then Waiting to process → Reading document → Understanding complex pages → Building index → Finalizing → Ready. Processing failed, Index incomplete (upload the same file again to repair it) and No readable content are explained. Delete asks for confirmation. The list is polled every 2 s only while something is queued or processing, and uploads beyond the API's queue wait in the browser until a slot frees.
-- **Tables:** tables in answers and in source passages (PyMuPDF4LLM extracts them as pipe tables) render as real tables with numeric columns right-aligned; cells stay plain text.
-- **Emoji:** every emoji, in the interface and inside answers or documents, is drawn with Apple's emoji artwork so it looks the same on every device. `npm run dev`/`npm run build` copy the images from the `emoji-datasource-apple` package into `web/public/emoji/` (generated, not committed; served lazily). Apple's emoji artwork is Apple's copyright and is not licensed for general web use; the project owner has chosen to ship it.
-- **Workspace:** collapsible sidebar (Ctrl/⌘ B) with conversations and documents, and light, dark and system themes. Below 1024 px (phones and tablets) the sidebar becomes a drawer and sources open in bottom sheets; touch screens get 40 px+ tap targets and 16 px input text.
-- **Safety:** document text, file names and sources render as plain text. Answers go through a Markdown renderer that drops HTML and images and renders no links except citation markers. No chunk ids, scores, internal ids or model reasoning are shown, and server error details never reach the page.
-
-## HTTP API
-
-`api.py` exposes the pipeline over HTTP; the web app is its only client. It is only an adapter: ingestion, retrieval, reranking, generation, prompts and citation validation are the unchanged `rag/` code.
+## Testing and CI/CD
 
 ```bash
-uv run uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1   # docs at http://127.0.0.1:8000/docs
+uv run pytest                                   # backend, offline
+cd web && npm test && npm run lint && npm run typecheck && npm run build
+RAG_LIVE_TESTS=1 uv run pytest tests/test_live_retrieval.py -v -s   # opt-in, real APIs
 ```
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/health` | Qdrant reachability (never calls Gemini, Jina or xAI); 503 when Qdrant is down |
-| `GET /api/documents` | Documents in the workspace, derived from Qdrant payloads (no chunk text). Status: `ready`, `incomplete` (stored points from an unfinished write; upload again), `queued`, `processing`, `failed`, or `empty` (no extractable text) |
-| `POST /api/documents` | Multipart `file` (PDF). 202 queued; 200 if the identical PDF is already stored and complete (nothing is re-processed); 409 if it is queued, processing or being deleted; 429 if the queue is full; 413 too large; 415 not a PDF |
-| `DELETE /api/documents/{document_id}` | Removes all of a document's chunks; 404 unknown, 409 queued, processing or already being deleted. Uploads of that document get 409 until the deletion finishes |
-| `POST /api/chat` | `{"question": ...}` → `answer`, `abstained`, `citations` (`[document, Page N]` validated against the chunks supplied to the model), `sources`, `kind` (`answer`, `abstain`, `out_of_scope`, `conversation`, `workspace`, `clarify`) and `suggestions` (one-tap follow-up questions). Each message is routed first (see below); raw model output is never returned. 503 if Qdrant fails, 502 if the embedder, reranker or answer model fails |
+The backend suite runs offline against in-memory Qdrant with fake embedders and models. It covers extraction, page routing, chunking, RRF, citation validation, the follow-up rewrite, the HTTP contract and write completeness. The frontend uses Vitest and Testing Library, including proxy validation and an axe-core accessibility check. The live test sends English, Hindi, Hinglish and cross-language queries through real Gemini, Jina and Qdrant. CI skips it.
 
-- **Routing before retrieval** (`rag/route.py`, deterministic, no model call). Greetings, thanks, "help" and follow-ups like "tell me more" get short replies without touching the workspace. "What documents are uploaded?" and "how many pages?" are answered from document metadata. Vague messages ("pdf", "what is this?") get a clarifying question with one-tap suggestions; a lone abbreviation ("ci") is expanded from the documents' own text ("Do you mean CI (Compound Interest)?"). Overview questions ("what is this about?", "what topics are covered?") use the named document's opening pages, and "what is on page 72?" uses that page's chunks, because semantic search cannot match either; both still go through the grounded generator and citation validation. Everything else takes the full retrieval pipeline. The generator refuses in two ways: `INSUFFICIENT_CONTEXT` (about the documents, but not answered by them) and `OUT_OF_SCOPE` (not about the documents, e.g. general knowledge); neither ever answers from general knowledge.
-- **Single workspace, no authentication.** Every client shares one Qdrant collection, `API_COLLECTION` (default `documents`, the one the CLI also writes to). There is no per-client isolation. Do not expose the API publicly: keep it on localhost behind a reverse proxy with TLS and access control.
-- **Background ingestion on one worker thread.** PDFs can take minutes, beyond proxy timeouts, and PyMuPDF must not run on several threads at once. At most one upload runs and one waits; further uploads get 429, so at most two PDFs are held in memory. Progress (`stage`, `pages`, `chunks`, `new_embeddings`, `error`) appears in `GET /api/documents`; a waiting upload shows stage `queued`.
-- **Completeness.** Every stored chunk carries its write's `chunk_total` and `write_id`. A document is `ready` only when all its points come from one write and their number matches `chunk_total`, so a write cut short by a failure or a restart shows as `incomplete`, never `ready`. Points stored before these fields existed also show as `incomplete` until uploaded again. Retrieval uses the same rule: dense search and BM25 only consider chunks of complete documents, so an `incomplete` document never contributes to an answer (the CLI included). While a document is being re-ingested it drops out of search until the new write finishes.
-- **One process.** Job state is in memory, so run a single Uvicorn worker; a restart forgets queued uploads (re-uploading is cheap: ingestion is idempotent and cached). Stopping the process waits for a running ingestion to finish.
-- `API_MAX_UPLOAD_MB` (default 200) limits upload size. Starlette receives the whole request before that check runs, so the reverse proxy must enforce the same limit, e.g. nginx `client_max_body_size 200M;`.
+[`evals/`](evals/) holds a 30-question gold set over three public annual reports and a retrieval benchmark script (Recall@5/10, MRR@10, nDCG@10). The PDFs are not committed, and no scores are published yet.
 
-## Deployment
+CI runs on every pull request and every push to `main`. The backend job runs `uv sync --frozen` and pytest. The frontend job runs `npm ci`, Vitest, ESLint, `tsc` and a production build.
 
-```text
-Internet -> Nginx (HTTPS, Let's Encrypt, access control)
-              -> Next.js (node server.js) 127.0.0.1:3000
-                   -> FastAPI (uvicorn api:app, 1 worker) 127.0.0.1:8000
-                        -> Qdrant (Docker) 127.0.0.1:6333
-                        -> xAI, Gemini, Jina APIs
-```
+CD starts only when CI passes on a push to `main`:
 
-Runs on the OCI VM (Ubuntu 24.04, ARM64) with Docker for Qdrant and two systemd units, [`deploy/rag-api.service`](deploy/rag-api.service) and [`deploy/rag-web.service`](deploy/rag-web.service), the web unit ordered after the API. Only Nginx is public ([`deploy/nginx.conf`](deploy/nginx.conf)): it proxies everything to Next.js, which serves the UI and forwards `/api/*` server-side. Nginx never proxies to FastAPI directly. No extra containers; other services on the VM are left alone.
+1. It connects to the Oracle Cloud VM over SSH and refuses to deploy over a dirty working tree.
+2. It checks out the exact commit CI tested.
+3. It runs `uv sync --frozen`, `npm ci` and `npm run build`.
+4. It restarts the `rag-api` and `rag-web` systemd services.
+5. It waits up to 30 s for each service to answer locally, then confirms both are active.
 
-```bash
-# on the VM, from the repository checkout (Node.js 24 LTS for linux-arm64, and uv, installed)
-uv sync --frozen
-(cd web && npm ci && npm run build)      # builds web/.next/standalone with its static assets
-sudo cp deploy/rag-*.service /etc/systemd/system/ && sudo systemctl daemon-reload
-sudo systemctl enable --now rag-api rag-web
-```
-
-The units assume the checkout at `/opt/multimodal-enterprise-rag`, run as user `rag`; adjust both to the VM. After pulling changes, rebuild the web app and `sudo systemctl restart rag-api rag-web`.
-
-**Nginx basic auth is required.** The app has no authentication and one shared workspace: anyone who reaches it can read every document and delete it. [`deploy/nginx.conf`](deploy/nginx.conf) enables `auth_basic` for the whole site; create the password file first (`sudo htpasswd -c /etc/nginx/rag.htpasswd <user>`, from `apache2-utils`) and check `sudo nginx -t`. Without it Nginx fails closed with 500, but do not expose the site until a login is required. Keep `client_max_body_size 200M;` (Starlette reads an upload fully before the API's own size check) and a read timeout longer than the slowest answer.
-
-## Evaluation
-
-[`evals/gold.jsonl`](evals/gold.jsonl) holds 30 questions over three public annual reports: English, Hindi, Hinglish, cross-language, tables, visual pages, unanswerable questions and prompt injection. The PDFs are not committed. No end-to-end score (accuracy, Recall@K, faithfulness) is claimed yet; the set exists so those can be measured reproducibly.
+In production, Nginx terminates HTTPS (certbot) and caps uploads at 200 MB, and its site config enables basic auth. Behind it run the Next.js standalone server, one Uvicorn worker and Qdrant in Docker, all on localhost. There is one worker because upload jobs live in memory. Unit files and the site config are in [`deploy/`](deploy/).
 
 ## Limitations
 
-- No authentication and one shared workspace: everyone with access sees, uses and can delete every document.
-- Legacy non-Unicode Hindi fonts (e.g. Arjun, BHARTIYA-HINDI_081) extract as Latin gibberish. Pages that are mostly legacy text are re-read by the vision model; an English page with only a little legacy text (a Hindi heading, say) keeps that text as gibberish.
-- Unicode Hindi extraction drops parts of some conjuncts and doubles some vowel signs, which weakens BM25.
-- Routing thresholds are heuristic: uncaptioned or decorative images can still reach the vision model, and vector-drawn charts are missed.
-- Follow-ups see only the last 3 answered exchanges, and only to rewrite the request: a reference further back is lost. The rewrite costs one extra model call (about 2 s) on every non-small-talk message after the first, and a first message cannot point back to anything ("tell me more" as an opening message gets a clarifying question).
-- Citation validation checks that every cited (document, page) was actually supplied to the model, not that the page entails the sentence. The prompt forbids conclusions, judgements and recommendations the sources do not state (e.g. "which is better for a borrower" now abstains), but a model can still paraphrase beyond its evidence; claim-level verification is future work.
-- Page numbers are physical PDF pages starting at 1, which can differ from the page labels printed in a book or its table of contents. Only pages with indexed text are known ("N indexed pages"); the PDF's total page count is not stored.
-- Routing is deterministic and heuristic: unusual phrasings of small talk or metadata questions fall through to the full pipeline (the safe default). Clearly unrelated questions are refused by the generator after retrieval, so they still cost one retrieval and one model call.
-- Overviews read one document's opening pages (title, contents section, first informative pages within the first 30). A document whose contents appear later, or that has none, gets a thinner overview.
-- The pipeline was benchmarked with MiniMax-M3. Grok 4.7 replaced it without a re-run of those checks: citation compliance, the refusal tokens and Hindi transcription quality need a live check with a real key.
-- Single process, not load-tested.
+- There is no app-level login and one shared workspace. Anyone who reaches the site can read and delete every document, so Nginx basic auth is the only gate.
+- The pipeline was benchmarked with MiniMax-M3. Grok 4.7 replaced it without a re-run.
+- Citation checks confirm a cited page was supplied, not that it supports the sentence.
+- Page routing and chat routing are heuristics. Vector-drawn charts are missed, and a little legacy-font text on a mostly English page stays garbled.
+- Follow-ups see only 3 exchanges. Document scoping applies only when the rewrite names the file.
+- Page numbers are physical PDF pages, which can differ from printed page labels.
+- It runs as a single process with in-memory job state, and it hasn't been load-tested.
