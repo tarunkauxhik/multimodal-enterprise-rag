@@ -374,7 +374,7 @@ def test_format_report_says_when_m3_was_disabled():
 def offline_cli(monkeypatch, tmp_path):
     """rag.ingest.main wired to fakes: in-memory Qdrant, hash embedder, fake vision model, caches under tmp_path."""
     monkeypatch.setattr(ingest_module, "load_settings", lambda: SimpleNamespace(
-        qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", xai_api_key="k", xai_base_url="u"))
+        qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", minimax_api_key="k", minimax_base_url="u"))
     monkeypatch.setattr(ingest_module, "QdrantClient", lambda **kw: QdrantClient(":memory:"))
     monkeypatch.setattr(ingest_module, "gemini_embedder", lambda key, task: hash_embed)
     monkeypatch.setattr(ingest_module, "llm_client", lambda *a, **kw: FakeM3())
@@ -432,7 +432,7 @@ def noisy_embedder(texts):
 
 tmp = Path(sys.argv[1])
 ingest.load_settings = lambda: SimpleNamespace(
-    qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", xai_api_key="k", xai_base_url="u")
+    qdrant_url="http://unused", qdrant_api_key=None, gemini_api_key="k", minimax_api_key="k", minimax_base_url="u")
 ingest.QdrantClient = lambda **kw: QdrantClient(":memory:")
 ingest.gemini_embedder = lambda key, task: noisy_embedder
 ingest.llm_client = lambda *a, **kw: FakeM3()
