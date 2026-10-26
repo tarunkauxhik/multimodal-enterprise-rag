@@ -25,10 +25,10 @@ flowchart LR
         A --> Q[("Qdrant<br/>:6333")]
         A --> C[("SQLite<br/>caches")]
     end
-    A -.-> X["External APIs<br/>Grok · Gemini · Jina"]
+    A -.-> X["External APIs<br/>MiniMax · Gemini · Jina"]
 ```
 
-Next.js renders the UI and forwards five allowlisted endpoints to FastAPI, where all RAG logic lives. Grok reads hard pages, rewrites follow-ups and writes answers; Gemini embeds; Jina reranks.
+Next.js renders the UI and forwards five allowlisted endpoints to FastAPI, where all RAG logic lives. MiniMax-M3 reads hard pages, rewrites follow-ups and writes answers; Gemini embeds; Jina reranks.
 
 ### Low level design
 
@@ -37,12 +37,12 @@ Next.js renders the UI and forwards five allowlisted endpoints to FastAPI, where
 flowchart TB
     subgraph ING["Ingestion: ingest"]
         direction LR
-        EX["extract<br/>PyMuPDF4LLM"] --> UN["understand<br/>Grok, hard pages"] --> CH["chunk<br/>page-bound"] --> EM["embed<br/>Gemini 768d"] --> ST[("store<br/>Qdrant")]
+        EX["extract<br/>PyMuPDF4LLM"] --> UN["understand<br/>MiniMax, hard pages"] --> CH["chunk<br/>page-bound"] --> EM["embed<br/>Gemini 768d"] --> ST[("store<br/>Qdrant")]
     end
 
     subgraph ASK["Question answering: session.respond"]
         direction TB
-        MSG["Message +<br/>last 3 exchanges"] --> CX["contextualize<br/>Grok rewrite, follow-ups only"]
+        MSG["Message +<br/>last 3 exchanges"] --> CX["contextualize<br/>MiniMax rewrite, follow-ups only"]
         CX --> RT{"route"}
         RT -->|"small talk,<br/>metadata"| DIRECT["Direct reply,<br/>no retrieval"]
         RT -->|"page, overview"| PICK["Chosen chunks"]
@@ -56,7 +56,7 @@ flowchart TB
         DN --> RRF["RRF k=60<br/>top 10"]
         BM --> RRF
         RRF --> JR["Jina rerank<br/>top 5"]
-        JR --> GEN["generate, Grok<br/>typed question + rewrite"]
+        JR --> GEN["generate, MiniMax<br/>typed question + rewrite"]
         PICK --> GEN
         GEN --> VAL{"valid<br/>citations?"}
         VAL -->|"yes"| ANS["Answer +<br/>sources"]
@@ -97,7 +97,7 @@ The workflows show the same two paths from the user's side: upload statuses, the
 ### Document ingestion
 
 - **PDF extraction.** PyMuPDF4LLM turns every page into typed blocks: headings, text, tables, figures and captions.
-- **Selective multimodal processing.** Grok reads a page image only when the fast text is likely incomplete:
+- **Selective multimodal processing.** MiniMax-M3 reads a page image only when the fast text is likely incomplete:
   - a scan (under 50 characters and a large image);
   - garbled text (≥ 1% U+FFFD);
   - mostly a legacy Hindi font such as Kruti Dev;
@@ -109,7 +109,7 @@ The workflows show the same two paths from the user's side: upload statuses, the
 
 ### Question answering
 
-- **Conversation contextualization.** With earlier turns, one short Grok call rewrites the message into a standalone request ("and the next page?" becomes "What is on page 4 of SRS.pdf?"). First messages and small talk skip it, and a new topic comes back unchanged.
+- **Conversation contextualization.** With earlier turns, one short MiniMax call rewrites the message into a standalone request ("and the next page?" becomes "What is on page 4 of SRS.pdf?"). First messages and small talk skip it, and a new topic comes back unchanged.
 - **Routing and document scoping.** A deterministic router answers small talk and metadata questions directly. Page and overview questions get their chunks without search, since "page 72" has nothing to match. A question that names a document searches only that document.
 - **Hybrid retrieval.** Dense search covers paraphrase and cross-language questions. BM25 catches exact names and numbers, and its tokenizer keeps Devanagari words whole. BM25 is rebuilt from Qdrant payloads, so the two indexes can't drift.
 - **RRF and reranking.** The scores aren't comparable, so ranks are fused with RRF. Jina then keeps the best 5 for the answer.
@@ -119,15 +119,15 @@ The workflows show the same two paths from the user's side: upload statuses, the
 ### Caching and reliability
 
 - **`embeddings.sqlite`** is keyed by sha256(model, dimensions, task, text) and stores the vector. Chunks and questions are cached alike, so repeated text is never re-embedded.
-- **`understanding.sqlite`** is keyed by sha256(provider/model, prompt version, DPI, document, page, task) and stores Grok's JSON result. Only successes are cached.
+- **`understanding.sqlite`** is keyed by sha256(provider/model, prompt version, DPI, document, page, task) and stores MiniMax's JSON result. Only successes are cached.
 - **Reuse.** Re-ingesting a PDF reuses both caches, so even an interrupted run skips finished work. A new model or prompt version changes the key and forces a recompute. Neither cache expires or has a cleanup command.
 - **Write completeness.** Every Qdrant write is tagged with a `write_id` and chunk count, so a write cut short by a crash is never retrieved.
 - **Failure handling.**
-  - Grok and Jina calls retry 408, 429, 5xx and network errors with backoff, and Gemini retries through its SDK.
+  - MiniMax and Jina calls retry 408, 429, 5xx and network errors with backoff, and so do MiniMax's transient `base_resp` error codes (rate limits, timeouts, high load) returned with HTTP 200. Gemini retries through its SDK.
   - A reply cut off at the token limit raises an error instead of returning half an answer.
   - A failed rewrite (one attempt, 15 s timeout) keeps the typed message.
   - Questions are capped at 2,000 characters and history at 3 turns.
-  - All Grok calls run at low reasoning effort.
+  - All MiniMax calls run with thinking disabled, so replies carry no reasoning text.
 
 ## Sessions, documents and deletion
 
@@ -151,13 +151,13 @@ CD runs only after CI passes on `main`. Over SSH it refuses a dirty working tree
 |---|---|
 | Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4, shadcn/ui |
 | Backend | Python 3.12, FastAPI, httpx, uv |
-| Models | xAI `grok-4.7`, Google `gemini-embedding-2` (768 dims), Jina `jina-reranker-v3` |
+| Models | MiniMax M3 (M3.1 Flash also supported) over an OpenAI-compatible API, Google `gemini-embedding-2` (768 dims), Jina `jina-reranker-v3` |
 | Documents and retrieval | PyMuPDF4LLM, Qdrant (cosine), rank-bm25, SQLite caches |
 | Ops | Oracle Cloud VM, Nginx, systemd, Docker, GitHub Actions |
 
 ## Run locally
 
-You need [uv](https://docs.astral.sh/uv/), Node.js 22.22+ or 24.15+, Docker, and keys for xAI, Gemini and Jina. The API won't start without the keys; the offline tests don't need them.
+You need [uv](https://docs.astral.sh/uv/), Node.js 22.22+ or 24.15+, Docker, and keys for MiniMax, Gemini and Jina. The API won't start without the keys; the offline tests don't need them.
 
 ```bash
 uv sync
@@ -174,7 +174,7 @@ npm ci
 npm run dev -- --hostname 127.0.0.1    # http://127.0.0.1:3000
 ```
 
-`.env.example` lists the variables. The required ones are `XAI_API_KEY`, `GEMINI_API_KEY` and `JINA_API_KEY`. The optional ones (`XAI_BASE_URL`, `QDRANT_URL`, `QDRANT_API_KEY`) default to the public xAI endpoint and local Qdrant.
+`.env.example` lists the variables. The required ones are the MiniMax API key (`MINIMAX_API_KEY`), its OpenAI-compatible base URL (`MINIMAX_BASE_URL`, ending in `/v1`), `GEMINI_API_KEY` and `JINA_API_KEY`. The optional ones (`QDRANT_URL`, `QDRANT_API_KEY`) default to local Qdrant.
 
 ## Testing
 
@@ -195,7 +195,7 @@ The backend suite runs against in-memory Qdrant with fake models. It covers extr
 ## Limitations
 
 - No accounts and one shared workspace (see Access control).
-- Grok 4.7 replaced the benchmarked MiniMax-M3 without a re-run.
+- MiniMax M3 is the default; M3.1 Flash is a one-line switch (`LLM_MODEL`). M3 was preferred on a small A/B of this pipeline's tasks, not on the eval set.
 - Citation checks confirm a cited page was supplied, not that it supports the sentence.
 - Page and chat routing are heuristics. Vector-drawn charts are missed.
 - Follow-ups see only 3 exchanges. Document scoping applies only when the rewrite names the file.

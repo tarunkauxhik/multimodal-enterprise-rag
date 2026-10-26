@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from rag.config import DEFAULT_XAI_BASE_URL, GENERATION_MAX_TOKENS, GENERATION_REASONING_EFFORT, LLM_MODEL
+from rag.config import GENERATION_MAX_TOKENS, LLM_MODEL
 from rag.generate import (
     ABSTAIN_MESSAGE,
     ABSTAIN_TOKEN,
@@ -157,6 +157,14 @@ def test_prompt_requires_grounding_citations_and_abstention():
     assert user["content"].index("Question: How much leave?") > user["content"].rindex("</source>")
 
 
+def test_both_refusals_are_restated_after_the_question():
+    # With only ABSTAIN_TOKEN restated last, MiniMax-M3 never chose SCOPE_TOKEN for general-knowledge questions.
+    _, user = build_messages("What is the capital of France?", CHUNKS)
+    tail = user["content"][user["content"].index("Question:"):]
+    assert SCOPE_TOKEN in tail and ABSTAIN_TOKEN in tail
+    assert tail.index(SCOPE_TOKEN) < tail.index(ABSTAIN_TOKEN)  # scope decided first, as in rule 3
+
+
 # 3. Prompt injection ----------------------------------------------------------
 
 INJECTED = {
@@ -203,8 +211,8 @@ def test_strip_think(raw, expected):
 
 
 def test_stripping_cannot_recover_an_answer_started_inside_think():
-    # Seen with the earlier MiniMax-M3 (MiniMax-AI/MiniMax-M3#28): the answer's opening words land inside
-    # <think>. No stripping rule can tell them from reasoning; Grok returns reasoning in a separate field.
+    # MiniMax-AI/MiniMax-M3#28: with thinking on, the answer's opening words can land inside <think>.
+    # No stripping rule can tell them from reasoning, which is why every call runs with thinking disabled.
     raw = "<think>\nI should greet them in Spanish.¡Hola! 👋 ¿Cómo\n</think>\n\nestás?"
     assert strip_think(raw) == "estás?"
 
@@ -222,13 +230,13 @@ def test_citations_inside_think_are_ignored():
     assert answer.text == "Leave is 24 days [handbook.pdf, Page 3]." and answer.removed_citations == []
 
 
-# 5. API client (xAI Chat Completions) ------------------------------------------
+# 5. API client (MiniMax Chat Completions, OpenAI-compatible) ---------------------
 
-KEY = "xai-secret-key-456"
-BASE = DEFAULT_XAI_BASE_URL
+KEY = "mm-secret-key-456"
+BASE = "https://llm.example.com/v1"
 
 
-def ok(content, finish_reason="stop", reasoning=None):
+def ok(content, finish_reason="stop", reasoning=None, base_resp=None):
     message = {"role": "assistant", "content": content}
     if reasoning is not None:
         message["reasoning_content"] = reasoning
@@ -239,16 +247,22 @@ def ok(content, finish_reason="stop", reasoning=None):
             "object": "chat.completion",
             "model": LLM_MODEL,
             "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "completion_tokens_details": {"reasoning_tokens": 5}},
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "base_resp": base_resp or {"status_code": 0, "status_msg": ""},
         },
     )
+
+
+def base_resp_error(code, msg):
+    """MiniMax reports some failures as HTTP 200 with a non-zero base_resp and no choices."""
+    return httpx.Response(200, json={"id": "x", "choices": None, "base_resp": {"status_code": code, "status_msg": msg}})
 
 
 def client(handler, sleeps, **kwargs):
     return llm_client(KEY, BASE, transport=httpx.MockTransport(handler), sleep=sleeps.append, **kwargs)
 
 
-def test_client_sends_xai_chat_completions_request():
+def test_client_sends_minimax_chat_completions_request():
     seen = {}
 
     def handler(request):
@@ -258,27 +272,27 @@ def test_client_sends_xai_chat_completions_request():
 
     messages = [{"role": "user", "content": "hello"}]
     assert client(handler, [])(messages) == "Hi"
-    assert seen["method"] == "POST" and seen["url"] == "https://api.x.ai/v1/chat/completions"
+    assert seen["method"] == "POST" and seen["url"] == "https://llm.example.com/v1/chat/completions"
     assert seen["auth"] == f"Bearer {KEY}"
     assert seen["body"] == {
-        "model": "grok-4.7",
+        "model": "MiniMax-M3",
         "messages": messages,
         "max_completion_tokens": GENERATION_MAX_TOKENS,
-        "reasoning_effort": GENERATION_REASONING_EFFORT,
+        "thinking": {"type": "disabled"},
     }
-    assert "thinking" not in seen["body"] and "max_tokens" not in seen["body"]  # MiniMax-only / deprecated
+    assert "reasoning_effort" not in seen["body"] and "max_tokens" not in seen["body"]  # ignored by M3 / deprecated
 
 
-def test_client_passes_model_tokens_and_reasoning_effort():
+def test_client_passes_model_and_tokens_and_can_leave_thinking_on():
     seen = {}
 
     def handler(request):
         seen["body"] = json.loads(request.content)
         return ok("Hi")
 
-    client(handler, [], model="grok-other", max_tokens=123, reasoning_effort="high")([])
-    assert seen["body"]["model"] == "grok-other"
-    assert seen["body"]["max_completion_tokens"] == 123 and seen["body"]["reasoning_effort"] == "high"
+    client(handler, [], model="MiniMax-other", max_tokens=123, thinking=True)([])
+    assert seen["body"]["model"] == "MiniMax-other" and seen["body"]["max_completion_tokens"] == 123
+    assert "thinking" not in seen["body"]  # MiniMax's default: thinking on
 
 
 def test_client_returns_content_and_never_reasoning_content():
@@ -308,6 +322,45 @@ def test_client_retries_transient_http_errors(status):
 
 
 @pytest.mark.parametrize(
+    "code, msg",
+    [(1000, "unknown error"), (1001, "request timeout"), (1002, "rate limit"), (1024, "internal error"),
+     (1039, "token limit"), (1045, "rate limit exceeded (task concurrency)"), (2064, "cluster under high load"),
+     (2066, "request timed out")],
+)
+def test_client_retries_transient_minimax_errors(code, msg):
+    responses, sleeps = iter([base_resp_error(code, msg), ok("done")]), []
+    assert client(lambda r: next(responses), sleeps)([]) == "done"
+    assert len(sleeps) == 1
+
+
+def test_a_persistent_concurrency_limit_keeps_the_same_retry_limit_and_backoff():
+    calls, sleeps = [], []
+
+    def handler(request):
+        calls.append(1)
+        return base_resp_error(1045, "rate limit exceeded (task concurrency)")
+
+    with pytest.raises(RuntimeError, match="MiniMax error 1045"):
+        client(handler, sleeps)([])
+    assert len(calls) == 5  # attempts unchanged
+    assert [int(s) for s in sleeps] == [1, 2, 4, 8]  # exponential backoff (plus under 1 s of jitter)
+
+
+@pytest.mark.parametrize(
+    "code, msg",
+    [(1004, f"not authorized {KEY}"), (1008, "insufficient balance"), (1027, "output new_sensitive"),
+     (2013, "invalid params"), (2022, "model is not exist"), (2049, f"invalid api key {KEY}")],
+)
+def test_client_does_not_retry_permanent_minimax_errors_and_redacts_key(code, msg):
+    sleeps = []
+    with pytest.raises(RuntimeError) as exc:
+        client(lambda r: base_resp_error(code, msg), sleeps)([])
+    message = str(exc.value)
+    assert message.startswith(f"LLM completion failed: MiniMax error {code}") and KEY not in message
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
     "first",
     [httpx.Response(200, text="not json"), httpx.Response(200, json={"choices": []}), httpx.Response(200, json=[1])],
     ids=["invalid-json", "no-choices", "not-an-object"],
@@ -321,7 +374,7 @@ def test_client_retries_malformed_replies(first):
 @pytest.mark.parametrize(
     "response",
     [
-        httpx.Response(400, json={"code": "Client specified an invalid argument", "error": "bad model"}),
+        httpx.Response(400, json={"base_resp": {"status_code": 2013, "status_msg": "invalid params"}}),
         httpx.Response(401, text=f"Incorrect API key provided: {KEY}"),
         httpx.Response(403, json={"error": f"forbidden for {KEY}"}),
         httpx.Response(404, json={"error": "model not found"}),

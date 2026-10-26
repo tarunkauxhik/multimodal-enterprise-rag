@@ -37,7 +37,6 @@ from rag.config import (
     QDRANT_COLLECTION,
     UNDERSTAND_CACHE_PATH,
     UNDERSTAND_MAX_TOKENS,
-    UNDERSTAND_REASONING_EFFORT,
     load_settings,
 )
 from rag.embed import EmbedBatch, EmbeddingCache, EmbedStats, embed_texts, gemini_embedder
@@ -281,9 +280,7 @@ def _ingest_paths(pdfs: list[Path], summary: bool) -> tuple[list[IngestReport], 
     settings = load_settings()
     client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     embed_batch = gemini_embedder(settings.gemini_api_key, EMBED_TASK_DOCUMENT)
-    complete = llm_client(
-        settings.xai_api_key, settings.xai_base_url, max_tokens=UNDERSTAND_MAX_TOKENS, reasoning_effort=UNDERSTAND_REASONING_EFFORT
-    )
+    complete = llm_client(settings.minimax_api_key, settings.minimax_base_url, max_tokens=UNDERSTAND_MAX_TOKENS)
     cache = EmbeddingCache(EMBED_CACHE_PATH)
     understanding_cache = UnderstandingCache(UNDERSTAND_CACHE_PATH)
 

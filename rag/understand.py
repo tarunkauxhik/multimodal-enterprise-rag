@@ -1,4 +1,4 @@
-"""Selective multimodal page understanding with the vision LLM (xAI Grok 4.7).
+"""Selective multimodal page understanding with the vision LLM (MiniMax-M3).
 
 The fast PyMuPDF4LLM extraction stays the default. Only pages whose extraction
 is likely incomplete are rendered and sent to the model, for these reasons:
@@ -19,7 +19,7 @@ stay table blocks), garbled and legacy pages get their text replaced, figures ge
 content, sparse tables are re-extracted. Any failure keeps the page's original
 extraction. Successful results are cached so re-ingestion is stable and does not
 call the model again. The cache key includes the provider and model, so results from
-another model (e.g. the earlier MiniMax-M3) are never reused.
+another provider or model are never reused.
 """
 
 import hashlib
